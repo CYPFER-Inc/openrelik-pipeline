@@ -140,3 +140,5 @@ You can download the `Windows.Triage.Targets` artifact from [here](https://triag
 > [!IMPORTANT]  
 > **I strongly recommend deploying OpenRelik and Timesketch with HTTPS**--additional instructions for Timesketch, OpenRelik, and Velociraptor are provided [here](https://github.com/google/timesketch/blob/master/docs/guides/admin/install.md#4-enable-tls-optional), [here](https://github.com/openrelik/openrelik.org/blob/main/content/guides/nginx.md), ahd [here](https://docs.velociraptor.app/docs/deployment/security/#deployment-signed-by-lets-encrypt). For this proof of concept, we're using HTTP. Modify your configs to reflect HTTPS if you deploy for production use. 
 
+## Security Scanning
+See [docs/trivy-scanning.md](docs/trivy-scanning.md) for local Trivy scan instructions
