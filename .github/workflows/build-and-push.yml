@@ -37,7 +37,10 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: cypfer-inc/openrelik-pipeline 
+  # IMAGE_NAME is computed dynamically as lowercase in each job (see 'Lowercase image name' step)
+  # This avoids GHCR parse errors caused by mixed-case org names like CYPFER-Inc
+  # Set to "true" only if GitHub Advanced Security is enabled on this repo (paid feature for private repos)
+  UPLOAD_SARIF: "false"  
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -62,14 +65,14 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -77,9 +80,9 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.value }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=sha-
@@ -89,7 +92,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' && github.event.inputs.push_image != 'false' }}
@@ -113,12 +116,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image | \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.REGISTRY }}/${{ steps.image-name.outputs.value }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Tags | ${{ steps.meta.outputs.tags }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "> To pin this exact build in docker-compose.yml:" >> $GITHUB_STEP_SUMMARY
-          echo "> \`image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "> \`image: ${{ env.REGISTRY }}/${{ steps.image-name.outputs.value }}@${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
 
   # ---------------------------------------------------------------------------
   # Job 2: Trivy scan the newly built image before it reaches production
@@ -138,8 +141,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Lowercase image name
+        id: image-name
+        run: echo "value=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -150,7 +157,7 @@ jobs:
         continue-on-error: true
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image-digest }}"
+          image-ref: "${{ env.REGISTRY }}/${{ steps.image-name.outputs.value }}@${{ needs.build-and-push.outputs.image-digest }}"
           format: sarif
           output: trivy-pipeline-build.sarif
           severity: "CRITICAL,HIGH"
@@ -169,7 +176,7 @@ jobs:
           fi
 
       - name: Upload SARIF
-        if: always() && steps.check-sarif.outputs.sarif_exists == 'true'
+        if: always() && steps.check-sarif.outputs.sarif_exists == 'true' && env.UPLOAD_SARIF == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: trivy-pipeline-build.sarif
