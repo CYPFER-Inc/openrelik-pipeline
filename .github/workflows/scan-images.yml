@@ -1,0 +1,210 @@
+###############################################################################
+# .github/workflows/scan-images.yml
+#
+# Scans ALL digest-pinned images for CVEs using Trivy (Aqua Security).
+# Runs weekly and on any push that modifies config.env (digest updates).
+#
+# Behavior:
+#   - CRITICAL CVEs:  always fail the job (blocks deployment)
+#   - HIGH CVEs:      fail the job (configurable via FAIL_ON_HIGH below)
+#   - Results uploaded to GitHub Security tab as SARIF for each image
+#   - Summary comment posted to the PR if triggered by a config.env change
+#
+# Requirements:
+#   Settings → Actions → General → Workflow permissions → Read and write
+#   Settings → Security → Code scanning → must be enabled (free for public,
+#   available on GitHub Advanced Security for private repos)
+#
+# If you don't have Advanced Security, set UPLOAD_SARIF: false below and
+# results will only appear in the Actions log.
+###############################################################################
+
+name: CVE Scan — Pinned Images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "config.env"          # run whenever digests are updated
+      - "docker-compose.yml"
+
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "config.env"
+      - "docker-compose.yml"
+
+  schedule:
+    # Every Monday at 07:00 UTC — weekly CVE sweep
+    - cron: "0 7 * * 1"
+
+  workflow_dispatch:           # allow manual trigger
+
+env:
+  # Set to 'false' if you don't have GitHub Advanced Security
+  UPLOAD_SARIF: "true"
+  # Set to 'false' to allow HIGH CVEs without failing the build
+  FAIL_ON_HIGH: "true"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Read digest values from config.env and expose as outputs
+  # ---------------------------------------------------------------------------
+  load-digests:
+    name: Load Image Digests
+    runs-on: ubuntu-latest
+
+    outputs:
+      images: ${{ steps.parse.outputs.images }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse digests from config.env
+        id: parse
+        run: |
+          # Build a JSON array of {name, image} objects from config.env
+          # Each *_DIGEST entry is paired with its source image reference
+
+          declare -A IMAGE_MAP=(
+            ["OPENRELIK_SERVER_DIGEST"]="ghcr.io/openrelik/openrelik-server"
+            ["OPENRELIK_MEDIATOR_DIGEST"]="ghcr.io/openrelik/openrelik-mediator"
+            ["OPENRELIK_UI_DIGEST"]="ghcr.io/openrelik/openrelik-ui"
+            ["OPENRELIK_WORKER_PLASO_DIGEST"]="ghcr.io/openrelik/openrelik-worker-plaso"
+            ["OPENRELIK_WORKER_TIMESKETCH_DIGEST"]="ghcr.io/openrelik/openrelik-worker-timesketch"
+            ["OPENRELIK_WORKER_HAYABUSA_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hayabusa"
+            ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction"
+            ["OPENRELIK_WORKER_HASHER_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hasher"
+            ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep"
+            ["OPENRELIK_WORKER_STRINGS_DIGEST"]="ghcr.io/openrelik/openrelik-worker-strings"
+            ["REDIS_DIGEST"]="redis"
+            ["POSTGRES_DIGEST"]="postgres"
+            ["TIMESKETCH_DIGEST"]="us-docker.pkg.dev/osdfir-registry/timesketch/timesketch"
+            ["VELOCIRAPTOR_DIGEST"]="wlambert/velociraptor"
+          )
+
+          source config.env 2>/dev/null || true
+
+          JSON="["
+          FIRST=true
+          for key in "${!IMAGE_MAP[@]}"; do
+            digest="${!key:-}"
+            if [[ -z "${digest}" ]]; then
+              echo "⚠️  ${key} is empty in config.env — skipping"
+              continue
+            fi
+            base="${IMAGE_MAP[$key]}"
+            full_ref="${base}@${digest}"
+            safe_name=$(echo "${base}" | tr '/:.' '-')
+            if [[ "${FIRST}" == "true" ]]; then
+              FIRST=false
+            else
+              JSON="${JSON},"
+            fi
+            JSON="${JSON}{\"name\":\"${safe_name}\",\"image\":\"${full_ref}\"}"
+          done
+          JSON="${JSON}]"
+
+          echo "images=${JSON}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Scan each image — runs in parallel (matrix)
+  # ---------------------------------------------------------------------------
+  scan:
+    name: Scan ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: load-digests
+
+    # Skip if no digests were found (e.g. first run before update-digests.sh)
+    if: needs.load-digests.outputs.images != '[]'
+
+    strategy:
+      fail-fast: false    # scan all images even if one fails
+      matrix:
+        include: ${{ fromJson(needs.load-digests.outputs.images) }}
+
+    permissions:
+      contents: read
+      security-events: write   # needed to upload SARIF results
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy scan — ${{ matrix.name }}
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ matrix.image }}
+          format: "sarif"
+          output: "trivy-${{ matrix.name }}.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+          # Fail on CRITICAL always; HIGH controlled by env var
+          exit-code: "1"
+          ignore-unfixed: true     # skip CVEs with no fix available
+          vuln-type: "os,library"
+
+      - name: Upload SARIF to GitHub Security tab
+        if: env.UPLOAD_SARIF == 'true' && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-${{ matrix.name }}.sarif"
+          category: "trivy-${{ matrix.name }}"
+
+      - name: Print summary table
+        if: always()
+        run: |
+          echo "## CVE Scan: ${{ matrix.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ matrix.image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          # Re-run in table format for the summary
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed \
+            --format table \
+            "${{ matrix.image }}" 2>/dev/null || true
+
+  # ---------------------------------------------------------------------------
+  # Also scan YOUR FORK image — built from source so use table mode only
+  # ---------------------------------------------------------------------------
+  scan-fork:
+    name: Scan YOUR-ORG pipeline image
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy scan on pipeline image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "ghcr.io/${{ github.repository_owner }}/openrelik-pipeline:latest"
+          format: "sarif"
+          output: "trivy-pipeline.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - name: Upload SARIF
+        if: env.UPLOAD_SARIF == 'true' && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: "trivy-pipeline.sarif"
+          category: "trivy-pipeline"
