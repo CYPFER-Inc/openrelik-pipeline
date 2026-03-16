@@ -1,11 +1,11 @@
 ###############################################################################
-# docker-compose.yml — CYPFER-Inc fork of openrelik-pipeline
+# docker-compose.yml — cypfer-inc fork of openrelik-pipeline
 #
 # SECURITY MODEL — THREE TIERS:
 #
 #   TIER 1 — YOUR FORK (tag-pinned, built by your CI):
 #     openrelik-pipeline      You own and modify this code.
-#                             CI publishes ghcr.io/CYPFER-Inc/openrelik-pipeline.
+#                             CI publishes ghcr.io/cypfer-inc/openrelik-pipeline.
 #                             Tag-pinned because you control every release.
 #
 #   TIER 2 — TRUSTED UPSTREAM, DIGEST-PINNED:
@@ -28,7 +28,7 @@
 #   .github/workflows/scan-images.yml  (weekly + on digest update PRs)
 #
 # BEFORE FIRST USE:
-#   1. Replace CYPFER-Inc everywhere with your actual GitHub org name
+#   1. Replace cypfer-inc everywhere with your actual GitHub org name
 #   2. cp config.env.example config.env  and fill in all values
 #   3. bash scripts/update-digests.sh   to populate real digest values
 #   4. bash install.sh
@@ -44,7 +44,7 @@ services:
 
   openrelik-pipeline:
     container_name: openrelik-pipeline
-    image: ghcr.io/CYPFER-Inc/openrelik-pipeline:${OPENRELIK_PIPELINE_VERSION:-latest}
+    image: ghcr.io/cypfer-inc/openrelik-pipeline:${OPENRELIK_PIPELINE_VERSION:-latest}
     restart: always
     ports:
       - "0.0.0.0:5000:5000"
