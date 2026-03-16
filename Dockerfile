@@ -1,6 +1,9 @@
 # Use an official Python base image
 FROM python:3.12-slim
 
+# pull the latest OS patches
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+
 # Create and set the working directory in the container
 WORKDIR /app
 
