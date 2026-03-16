@@ -143,7 +143,9 @@ jobs:
 
       - name: Lowercase image name
         id: image-name
-        run: echo "value=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "value=$(echo $REPO | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
 
       - name: Log in to GHCR
         uses: docker/login-action@v4
