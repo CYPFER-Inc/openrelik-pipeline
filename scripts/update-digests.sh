@@ -18,7 +18,7 @@
 #   1. Run this script
 #   2. Review the diff: git diff config.env
 #   3. Check upstream changelogs for each image that changed
-#   4. Run: bash scripts/scan-digests.sh   (optional local CVE scan)
+#   3. Push to main — triggers scan-images.yml CVE scan automatically
 #   5. Commit: git add config.env && git commit -m "chore: update image digests YYYY-MM-DD"
 # =============================================================================
 
@@ -158,5 +158,5 @@ echo ""
 echo "Next steps:"
 echo "  1. Review changes:      git diff ${ENV_FILE}"
 echo "  2. Check changelogs for any images that changed"
-echo "  3. Run CVE scan:        bash scripts/scan-digests.sh"
+echo "  3. Push:                git push origin main  (triggers CVE scan automatically)"
 echo "  4. Commit:              git add ${ENV_FILE} && git commit -m 'chore: update image digests $(date +%Y-%m-%d)'"
