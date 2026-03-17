@@ -1,5 +1,60 @@
 #!/bin/bash
 
+# ─── Pre-flight checks ────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${SCRIPT_DIR}/config.env"
+
+# Check config.env exists
+if [ ! -f "${CONFIG_FILE}" ]; then
+  echo "ERROR: config.env not found at ${CONFIG_FILE}"
+  echo "       Please contact your Admin for the latest"
+  echo "       file and instructions"
+  exit 1
+fi
+
+# Load all variables from config.env
+set -a
+source "${CONFIG_FILE}"
+set +a
+
+echo "config.env loaded successfully"
+
+# Check all digest fields are populated
+MISSING_DIGESTS=()
+
+DIGEST_VARS=(
+  "OPENRELIK_SERVER_DIGEST"
+  "OPENRELIK_MEDIATOR_DIGEST"
+  "OPENRELIK_UI_DIGEST"
+  "OPENRELIK_WORKER_PLASO_DIGEST"
+  "OPENRELIK_WORKER_TIMESKETCH_DIGEST"
+  "REDIS_DIGEST"
+  "POSTGRES_DIGEST"
+  "TIMESKETCH_DIGEST"
+  "VELOCIRAPTOR_DIGEST"
+)
+
+for VAR in "${DIGEST_VARS[@]}"; do
+  if [ -z "${!VAR}" ]; then
+    MISSING_DIGESTS+=("${VAR}")
+  fi
+done
+
+if [ ${#MISSING_DIGESTS[@]} -gt 0 ]; then
+  echo "ERROR: The following digest fields are empty in config.env:"
+  for VAR in "${MISSING_DIGESTS[@]}"; do
+    echo "       - ${VAR}"
+  done
+  echo ""
+  echo "       Please contact your Admin for the latest"
+  echo "       file and instructions"
+  exit 1
+fi
+
+echo "All digest fields verified"
+echo "─────────────────────────────────────────────────"
+
 # Set working directory to /opt
 cd /opt 
 
