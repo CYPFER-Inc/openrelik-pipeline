@@ -162,39 +162,13 @@ jobs:
 
       - name: Scan with Trivy
         id: trivy-scan
-        continue-on-error: true
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: "${{ env.REGISTRY }}/${{ steps.image-name.outputs.value }}@${{ needs.build-and-push.outputs.image-digest }}"
-          format: sarif
-          output: trivy-pipeline-build.sarif
+          format: table
           severity: "CRITICAL,HIGH"
           exit-code: "1"
           ignore-unfixed: true
-
-      - name: Check SARIF file exists
-        id: check-sarif
-        if: always()
-        run: |
-          if [ -f "trivy-pipeline-build.sarif" ]; then
-            echo "sarif_exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "sarif_exists=false" >> $GITHUB_OUTPUT
-            echo "SARIF file not created — skipping upload"
-          fi
-
-      - name: Upload SARIF
-        if: always() && steps.check-sarif.outputs.sarif_exists == 'true' && env.UPLOAD_SARIF == 'true'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: trivy-pipeline-build.sarif
-          category: trivy-pipeline-build
-
-      - name: Fail if CVEs found
-        if: steps.trivy-scan.outcome == 'failure'
-        run: |
-          echo "Trivy scan found CRITICAL or HIGH CVEs — see Security tab for details"
-          exit 1
 
   # ---------------------------------------------------------------------------
   # Job 3: Upstream sync (weekly schedule / manual only)
