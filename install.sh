@@ -52,8 +52,8 @@ cd /opt
 curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
 
 # patch the installer for the latest OpenRelik release for now
-NEW_LINE='sed -i '\''s/LATEST_RELEASE="0.7.0"/LATEST_RELEASE="0.7.0-rc.1"/g'\'' /opt/install.sh'
-sed -i "\|curl -s -O https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker/install.sh|a $NEW_LINE" /opt/openrelik-pipeline/install.sh
+sed -i 's/RELEASES=("0.7.0" "0.6.0")/RELEASES=("0.7.0" "0.6.0" "0.7.0-rc.1")/g' install.sh
+
 
 # Run the installation script
 bash install.sh
