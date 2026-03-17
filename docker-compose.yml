@@ -148,65 +148,13 @@ services:
       - openrelik_default
       - timesketch_default
 
-  openrelik-worker-extraction:
-    container_name: openrelik-worker-extraction
-    image: ghcr.io/openrelik/openrelik-worker-extraction@${OPENRELIK_WORKER_EXTRACTION_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-extraction"
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
+  # openrelik-worker-extraction removed — not required by DDI pipeline
 
-  openrelik-worker-hasher:
-    container_name: openrelik-worker-hasher
-    image: ghcr.io/openrelik/openrelik-worker-hasher@${OPENRELIK_WORKER_HASHER_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-hasher"
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
+  # openrelik-worker-hasher removed — no published image available
 
-  openrelik-worker-grep:
-    container_name: openrelik-worker-grep
-    image: ghcr.io/openrelik/openrelik-worker-grep@${OPENRELIK_WORKER_GREP_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-grep"
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
+  # openrelik-worker-grep removed — no published image available
 
-  openrelik-worker-strings:
-    container_name: openrelik-worker-strings
-    image: ghcr.io/openrelik/openrelik-worker-strings@${OPENRELIK_WORKER_STRINGS_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=4 --loglevel=INFO -Q openrelik-worker-strings"
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
+  # openrelik-worker-strings removed — no published image available
 
   # ============================================================
   # TIER 3 — INFRASTRUCTURE (Docker Hub official, digest-pinned)

@@ -187,7 +187,7 @@ sed -i "${insert_line}i\\
   \\
   openrelik-worker-timesketch:\\
       container_name: openrelik-worker-timesketch\\
-      image: ghcr.io/cypfer-inc/openrelik-worker-timesketch:\${OPENRELIK_WORKER_TIMESKETCH_DIGEST}\\
+      image: ghcr.io/cypfer-inc/openrelik-worker-timesketch@\${OPENRELIK_WORKER_TIMESKETCH_DIGEST}\\
       restart: always\\
       environment:\\
         - REDIS_URL=redis://openrelik-redis:6379\\
