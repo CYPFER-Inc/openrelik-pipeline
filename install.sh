@@ -49,7 +49,11 @@ echo -e "${TIMESKETCH_PASSWORD}\n${TIMESKETCH_PASSWORD}" | \
 # Deploy OpenRelik
 echo "Deploying OpenRelik..."
 cd /opt 
-curl -s -O https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker/install.sh
+curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
+
+# patch the installer for the latest OpenRelik release for now
+NEW_LINE='sed -i '\''s/LATEST_RELEASE="0.7.0"/LATEST_RELEASE="0.7.0-rc.1"/g'\'' /opt/install.sh'
+sed -i "\|curl -s -O https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker/install.sh|a $NEW_LINE" /opt/openrelik-pipeline/install.sh
 
 # Run the installation script
 bash install.sh
@@ -128,7 +132,7 @@ sed -i "${insert_line}i\\
   \\
   openrelik-worker-timesketch:\\
       container_name: openrelik-worker-timesketch\\
-      image: ghcr.io/openrelik/openrelik-worker-timesketch:\${OPENRELIK_WORKER_TIMESKETCH_VERSION}\\
+      image: ghcr.io/cypfer-inc/openrelik-worker-timesketch:\${OPENRELIK_WORKER_TIMESKETCH_DIGEST}\\
       restart: always\\
       environment:\\
         - REDIS_URL=redis://openrelik-redis:6379\\
@@ -148,7 +152,7 @@ docker compose up -d
 echo "Deploying the OpenRelik pipeline..."
 cd /opt/openrelik-pipeline 
 sed -i "s/YOUR_TIMESKETCH_PASSWORD/$TIMESKETCH_PASSWORD/g" ./docker-compose.yml
-docker compose build 
+docker compose pull 
 docker compose up -d 
 docker network connect openrelik_default openrelik-pipeline
 
