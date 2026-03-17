@@ -63,5 +63,8 @@ pip-log.txt
 pip-delete-this-directory.txt
 app.log
 
+# config.env file
+config.env
+
 # gcp credentials
 application_default_credentials.json 
