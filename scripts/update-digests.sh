@@ -83,7 +83,8 @@ declare -A IMAGES=(
   # Tier 2 — OpenRelik workers
   ["OPENRELIK_WORKER_PLASO_DIGEST"]="ghcr.io/openrelik/openrelik-worker-plaso:latest"
   ["OPENRELIK_WORKER_TIMESKETCH_DIGEST"]="ghcr.io/openrelik/openrelik-worker-timesketch:latest"
-  ["OPENRELIK_WORKER_HAYABUSA_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hayabusa:latest"
+  # Hayabusa runs inside the pipeline container — no separate image needed
+  # ["OPENRELIK_WORKER_HAYABUSA_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hayabusa:latest"
   ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction:latest"
   ["OPENRELIK_WORKER_HASHER_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hasher:latest"
   ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep:latest"

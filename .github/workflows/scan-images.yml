@@ -75,7 +75,8 @@ jobs:
             ["OPENRELIK_UI_DIGEST"]="ghcr.io/openrelik/openrelik-ui"
             ["OPENRELIK_WORKER_PLASO_DIGEST"]="ghcr.io/openrelik/openrelik-worker-plaso"
             ["OPENRELIK_WORKER_TIMESKETCH_DIGEST"]="ghcr.io/openrelik/openrelik-worker-timesketch"
-            ["OPENRELIK_WORKER_HAYABUSA_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hayabusa"
+            # Hayabusa runs inside the pipeline container — no separate image to scan
+            # ["OPENRELIK_WORKER_HAYABUSA_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hayabusa"
             ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction"
             ["OPENRELIK_WORKER_HASHER_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hasher"
             ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep"
