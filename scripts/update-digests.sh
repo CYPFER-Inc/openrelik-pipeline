@@ -85,10 +85,10 @@ declare -A IMAGES=(
   ["OPENRELIK_WORKER_TIMESKETCH_DIGEST"]="ghcr.io/openrelik/openrelik-worker-timesketch:latest"
   # Hayabusa runs inside the pipeline container — no separate image needed
   # ["OPENRELIK_WORKER_HAYABUSA_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hayabusa:latest"
-  ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction:latest"
-  ["OPENRELIK_WORKER_HASHER_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hasher:latest"
-  ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep:latest"
-  ["OPENRELIK_WORKER_STRINGS_DIGEST"]="ghcr.io/openrelik/openrelik-worker-strings:latest"
+  # ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction:latest" — not needed by DDI pipeline
+  # ["OPENRELIK_WORKER_HASHER_DIGEST"]="ghcr.io/openrelik/openrelik-worker-hasher:latest" — no published image
+  # ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep:latest" — no published image
+  # ["OPENRELIK_WORKER_STRINGS_DIGEST"]="ghcr.io/openrelik/openrelik-worker-strings:latest" — no published image
 
   # Tier 3 — Infrastructure
   ["REDIS_DIGEST"]="redis:7-alpine"
