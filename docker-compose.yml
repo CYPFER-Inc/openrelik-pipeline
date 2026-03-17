@@ -44,13 +44,13 @@ services:
 
   openrelik-pipeline:
     container_name: openrelik-pipeline
-    image: ghcr.io/YOUR-ORG/openrelik-pipeline:${OPENRELIK_PIPELINE_VERSION:-latest}
+    image: ghcr.io/cypfer-inc/openrelik-pipeline:${OPENRELIK_PIPELINE_VERSION:-latest}
     restart: always
     ports:
       - "0.0.0.0:5000:5000"
     environment:
       - OPENRELIK_SERVER_URL=http://openrelik-server:8710
-      - OPENRELIK_API_KEY=${OPENRELIK_API_KEY:?Set OPENRELIK_API_KEY in config.env after first boot}
+      - OPENRELIK_API_KEY=${OPENRELIK_API_KEY:-}
     volumes:
       - ./data:/usr/share/openrelik/data
     depends_on:
