@@ -203,14 +203,13 @@ sed -i "${insert_line}i\\
 docker network connect openrelik_default timesketch-web
 docker compose up -d
 
-
-# Use sed to insert cleanup lines before the pipeline deploy section
-sed -i 's/# Deploy OpenRelik pipeline/# Clean up any stale pipeline container\ndocker network disconnect openrelik_default openrelik-pipeline 2>\/dev\/null || true\ndocker rm -f openrelik-pipeline 2>\/dev\/null || true\n\n# Deploy OpenRelik pipeline/' /opt/openrelik-pipeline/install.sh
+# Clean up any stale pipeline container
+docker network disconnect openrelik_default openrelik-pipeline 2>/dev/null || true
+docker rm -f openrelik-pipeline 2>/dev/null || true
 
 # Deploy OpenRelik pipeline 
 echo "Deploying the OpenRelik pipeline..."
 cd /opt/openrelik-pipeline 
-sed -i "s/YOUR_TIMESKETCH_PASSWORD/$TIMESKETCH_PASSWORD/g" ./docker-compose.yml
 docker compose pull 
 docker compose up -d 
 docker network connect openrelik_default openrelik-pipeline
