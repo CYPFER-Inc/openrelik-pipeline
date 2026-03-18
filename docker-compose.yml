@@ -1,11 +1,3 @@
-###############################################################################
-# docker-compose.yml — openrelik-pipeline
-# 
-# This file manages ONLY the pipeline container.
-# Timesketch, OpenRelik, and Velociraptor are deployed separately
-# by install.sh and managed in their own compose stacks.
-###############################################################################
-
 services:
 
   openrelik-pipeline:
@@ -17,6 +9,9 @@ services:
     environment:
       - OPENRELIK_SERVER_URL=http://openrelik-server:8710
       - OPENRELIK_API_KEY=YOUR_API_KEY
+      - TIMESKETCH_SERVER_URL=http://timesketch-web:5000
+      - TIMESKETCH_USERNAME=admin
+      - TIMESKETCH_PASSWORD=${TIMESKETCH_PASSWORD}
     volumes:
       - /opt/openrelik/data:/usr/share/openrelik/data
     networks:
