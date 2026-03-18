@@ -1,22 +1,41 @@
+
 services:
 
   openrelik-pipeline:
+
     container_name: openrelik-pipeline
+
     image: ghcr.io/cypfer-inc/openrelik-pipeline:latest
+
     restart: always
+
     ports:
+
       - "0.0.0.0:5000:5000"
+
     environment:
-      - OPENRELIK_SERVER_URL=http://openrelik-server:8710
+
+      - OPENRELIK_API_URL=http://openrelik-server:8710
+
       - OPENRELIK_API_KEY=YOUR_API_KEY
-      - TIMESKETCH_SERVER_URL=http://timesketch-web:5000
+
+      - TIMESKETCH_URL=http://timesketch-web:5000
+
       - TIMESKETCH_USERNAME=admin
+
       - TIMESKETCH_PASSWORD=${TIMESKETCH_PASSWORD}
+
     volumes:
+
       - /opt/openrelik/data:/usr/share/openrelik/data
+
     networks:
+
       - openrelik_default
 
 networks:
+
   openrelik_default:
+
     external: true
+
