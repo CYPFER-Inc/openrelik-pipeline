@@ -1,239 +1,27 @@
 ###############################################################################
-# docker-compose.yml — YOUR-ORG fork of openrelik-pipeline
-#
-# SECURITY MODEL — THREE TIERS:
-#
-#   TIER 1 — YOUR FORK (tag-pinned, built by your CI):
-#     openrelik-pipeline      You own and modify this code.
-#                             CI publishes ghcr.io/YOUR-ORG/openrelik-pipeline.
-#                             Tag-pinned because you control every release.
-#
-#   TIER 2 — TRUSTED UPSTREAM, DIGEST-PINNED:
-#     openrelik-server        Google engineers maintain and patch these.
-#     openrelik-mediator      Pinned by immutable SHA256 digest — cannot be
-#     openrelik-ui            silently replaced or overwritten upstream.
-#     openrelik-worker-*      Update deliberately: scripts/update-digests.sh
-#
-#   TIER 3 — INFRASTRUCTURE + THIRD-PARTY, DIGEST-PINNED:
-#     redis / postgres        Docker Hub official images — large security teams,
-#     timesketch              rapid CVE response. No benefit to forking.
-#     velociraptor            All pinned by digest for supply-chain integrity.
-#
-# UPDATING DIGESTS (do this monthly or after upstream releases):
-#   bash scripts/update-digests.sh
-#   Review the diff carefully, check upstream changelogs, then commit.
-#
-# CVE SCANNING:
-#   All pinned images are scanned automatically by:
-#   .github/workflows/scan-images.yml  (weekly + on digest update PRs)
-#
-# BEFORE FIRST USE:
-#   1. Replace YOUR-ORG everywhere with your actual GitHub org name
-#   2. cp config.env.example config.env  and fill in all values
-#   3. bash scripts/update-digests.sh   to populate real digest values
-#   4. bash install.sh
+# docker-compose.yml — openrelik-pipeline
+# 
+# This file manages ONLY the pipeline container.
+# Timesketch, OpenRelik, and Velociraptor are deployed separately
+# by install.sh and managed in their own compose stacks.
 ###############################################################################
 
 services:
 
-  # ============================================================
-  # TIER 1 — YOUR FORK
-  # Built and published by your GitHub Actions CI.
-  # Tag-pinned: you control every version that ships.
-  # ============================================================
-
   openrelik-pipeline:
     container_name: openrelik-pipeline
-    image: ghcr.io/cypfer-inc/openrelik-pipeline:${OPENRELIK_PIPELINE_VERSION:-latest}
+    image: ghcr.io/cypfer-inc/openrelik-pipeline:latest
     restart: always
     ports:
       - "0.0.0.0:5000:5000"
     environment:
       - OPENRELIK_SERVER_URL=http://openrelik-server:8710
-      - OPENRELIK_API_KEY=${OPENRELIK_API_KEY:-}
+      - OPENRELIK_API_KEY=YOUR_API_KEY
     volumes:
-      - ./data:/usr/share/openrelik/data
-    depends_on:
-      - openrelik-server
+      - /opt/openrelik/data:/usr/share/openrelik/data
     networks:
       - openrelik_default
-
-  # ============================================================
-  # TIER 2 — OPENRELIK CORE (upstream, digest-pinned)
-  # Maintained by: github.com/openrelik
-  # Digests live in config.env — update via scripts/update-digests.sh
-  # ============================================================
-
-  openrelik-server:
-    container_name: openrelik-server
-    image: ghcr.io/openrelik/openrelik-server@${OPENRELIK_SERVER_DIGEST:?Run scripts/update-digests.sh to populate digests in config.env}
-    restart: always
-    ports:
-      - "0.0.0.0:8710:8710"
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-      - ./config:/usr/share/openrelik/config
-    depends_on:
-      - openrelik-redis
-      - openrelik-postgres
-    networks:
-      - openrelik_default
-
-  openrelik-mediator:
-    container_name: openrelik-mediator
-    image: ghcr.io/openrelik/openrelik-mediator@${OPENRELIK_MEDIATOR_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
-
-  openrelik-ui:
-    container_name: openrelik-ui
-    image: ghcr.io/openrelik/openrelik-ui@${OPENRELIK_UI_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    ports:
-      - "0.0.0.0:8711:8080"
-    depends_on:
-      - openrelik-server
-    networks:
-      - openrelik_default
-
-  # ============================================================
-  # TIER 2 — OPENRELIK WORKERS (upstream, digest-pinned)
-  # ============================================================
-
-  openrelik-worker-plaso:
-    container_name: openrelik-worker-plaso
-    image: ghcr.io/openrelik/openrelik-worker-plaso@${OPENRELIK_WORKER_PLASO_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - OPENRELIK_PYDEBUG=0
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=2 --loglevel=INFO -Q openrelik-worker-plaso"
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
-
-  # NOTE: openrelik-worker-hayabusa removed — Hayabusa runs inside the
-  # openrelik-pipeline container directly via the /api/hayabusa endpoint.
-  # No separate worker container is needed.
-
-  openrelik-worker-timesketch:
-    container_name: openrelik-worker-timesketch
-    image: ghcr.io/openrelik/openrelik-worker-timesketch@${OPENRELIK_WORKER_TIMESKETCH_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - TIMESKETCH_SERVER_URL=http://timesketch-web:5000
-      - TIMESKETCH_SERVER_PUBLIC_URL=http://${IP_ADDRESS:-localhost}
-      - TIMESKETCH_USERNAME=admin
-      - TIMESKETCH_PASSWORD=${TIMESKETCH_PASSWORD:?Set TIMESKETCH_PASSWORD in config.env}
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-timesketch"
-    depends_on:
-      - openrelik-redis
-    networks:
-      - openrelik_default
-      - timesketch_default
-
-  # openrelik-worker-extraction removed — not required by DDI pipeline
-
-  # openrelik-worker-hasher removed — no published image available
-
-  # openrelik-worker-grep removed — no published image available
-
-  # openrelik-worker-strings removed — no published image available
-
-  # ============================================================
-  # TIER 3 — INFRASTRUCTURE (Docker Hub official, digest-pinned)
-  # ============================================================
-
-  openrelik-redis:
-    container_name: openrelik-redis
-    image: redis@${REDIS_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    user: "999:999"
-    volumes:
-      - openrelik-redis-data:/data
-    networks:
-      - openrelik_default
-
-  openrelik-postgres:
-    container_name: openrelik-postgres
-    image: postgres@${POSTGRES_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    environment:
-      - POSTGRES_USER=${POSTGRES_USER:-openrelik}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in config.env}
-      - POSTGRES_DB=openrelik
-    volumes:
-      - openrelik-postgres-data:/var/lib/postgresql/data
-    networks:
-      - openrelik_default
-
-  # ============================================================
-  # THIRD-PARTY — DIGEST-PINNED
-  # ============================================================
-
-  timesketch-web:
-    container_name: timesketch-web
-    image: us-docker.pkg.dev/osdfir-registry/timesketch/timesketch@${TIMESKETCH_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    ports:
-      - "0.0.0.0:80:5000"
-    environment:
-      - TIMESKETCH_USER=admin
-      - TIMESKETCH_PASSWORD=${TIMESKETCH_PASSWORD:?Set TIMESKETCH_PASSWORD in config.env}
-    volumes:
-      - ./timesketch-data:/var/lib/timesketch
-      - ./timesketch-config:/etc/timesketch
-    networks:
-      - timesketch_default
-      - openrelik_default
-
-  velociraptor:
-    container_name: velociraptor
-    image: wlambert/velociraptor@${VELOCIRAPTOR_DIGEST:?Run scripts/update-digests.sh}
-    restart: always
-    ports:
-      - "0.0.0.0:8000:8000"
-      - "0.0.0.0:8001:8001"
-      - "0.0.0.0:8889:8889"
-    environment:
-      - VELOCIRAPTOR_USER=admin
-      - VELOCIRAPTOR_PASSWORD=${VELOCIRAPTOR_PASSWORD:?Set VELOCIRAPTOR_PASSWORD in config.env}
-      - VELOCIRAPTOR_FRONTEND_HOSTNAME=${IP_ADDRESS:-localhost}
-    volumes:
-      - ./velociraptor-data:/velociraptor
-    networks:
-      - openrelik_default
-
-# ============================================================
-# VOLUMES
-# ============================================================
-
-volumes:
-  openrelik-redis-data:
-  openrelik-postgres-data:
-
-# ============================================================
-# NETWORKS
-# ============================================================
 
 networks:
   openrelik_default:
-    driver: bridge
-  timesketch_default:
-    driver: bridge
+    external: true
