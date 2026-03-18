@@ -212,7 +212,6 @@ echo "Deploying the OpenRelik pipeline..."
 cd /opt/openrelik-pipeline 
 docker compose pull 
 docker compose up -d 
-docker network connect openrelik_default openrelik-pipeline
 
 # Deploy Velociraptor 
 echo "Deploying Velociraptor..."
