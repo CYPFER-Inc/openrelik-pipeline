@@ -148,6 +148,41 @@ grep -q '^[[:space:]]*storage_path[[:space:]]*=' "$CONFIG_TOML" || \
 
 docker compose up -d
 
+# --- Ensure OpenRelik database is initialised ---
+echo "Checking OpenRelik database initialisation..."
+
+# Wait for postgres and server to be ready
+sleep 10
+
+# Check if tables exist
+TABLE_COUNT=$(docker exec openrelik-postgres psql -U openrelik -d openrelik -t -c \
+  "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';" \
+  2>/dev/null | tr -d ' ')
+
+if [ -z "$TABLE_COUNT" ] || [ "$TABLE_COUNT" -lt 5 ]; then
+  echo "Database tables not found — running migrations..."
+  docker exec openrelik-server bash -c \
+    "cd /app/openrelik/datastores/sql && alembic upgrade head"
+  echo "Migrations complete"
+else
+  echo "Database tables verified ($TABLE_COUNT tables found)"
+fi
+
+# Check if admin user exists
+USER_EXISTS=$(docker exec openrelik-postgres psql -U openrelik -d openrelik -t -c \
+  "SELECT COUNT(*) FROM \"user\" WHERE username='admin';" \
+  2>/dev/null | tr -d ' ')
+
+if [ -z "$USER_EXISTS" ] || [ "$USER_EXISTS" -lt 1 ]; then
+  echo "Admin user not found — creating..."
+  docker exec openrelik-server python admin.py create-user admin \
+    --password "${OPENRELIK_ADMIN_PASSWORD}" --admin
+  echo "Admin user created"
+else
+  echo "Admin user verified"
+fi
+# -----------------------------------------------
+
 # --- Upgrade Plaso inside openrelik-worker-plaso to match Timesketch (PPA gift/stable) ---
 echo "Upgrading Plaso in openrelik-worker-plaso to match Timesketch..."
 
