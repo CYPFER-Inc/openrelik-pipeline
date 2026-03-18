@@ -188,11 +188,14 @@ echo "Deploying OpenRelik Timesketch worker..."
 line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
 insert_line=$((line - 1))
 
+# Get the actual digest value to write literally into the compose file
+TIMESKETCH_WORKER_DIGEST=$(grep OPENRELIK_WORKER_TIMESKETCH_DIGEST /opt/openrelik-pipeline/config.env | cut -d= -f2)
+
 sed -i "${insert_line}i\\
   \\
   openrelik-worker-timesketch:\\
       container_name: openrelik-worker-timesketch\\
-      image: ghcr.io/openrelik/openrelik-worker-timesketch@\${OPENRELIK_WORKER_TIMESKETCH_DIGEST}\\
+      image: ghcr.io/openrelik/openrelik-worker-timesketch@${TIMESKETCH_WORKER_DIGEST}\\
       restart: always\\
       environment:\\
         - REDIS_URL=redis://openrelik-redis:6379\\
