@@ -375,13 +375,15 @@ EOF
 docker compose build
 docker compose up -d
 
+# Replace the Velociraptor API configuration section with this:
+
 # Configure Velociraptor via API
 echo "Configuring Velociraptor via API..."
 
-# Wait for Velociraptor API to be ready
+# Wait for Velociraptor API using bash TCP instead of nc
 echo "Waiting for Velociraptor API on port 8001..."
 for i in $(seq 1 30); do
-  if docker exec velociraptor nc -z localhost 8001 2>/dev/null; then
+  if (echo > /dev/tcp/localhost/8001) 2>/dev/null; then
     echo "Velociraptor API is ready"
     break
   fi
@@ -389,10 +391,13 @@ for i in $(seq 1 30); do
   sleep 10
 done
 
-# Generate API client cert
+# Generate API client cert — output to file directly
 docker exec velociraptor /opt/velociraptor \
   --config /opt/server.config.yaml \
-  config api_client --name ansible > /tmp/vr-api-client.yaml
+  config api_client --name ansible --output /tmp/vr-api-client.yaml
+
+# Copy cert out of container to host
+docker cp velociraptor:/tmp/vr-api-client.yaml /tmp/vr-api-client.yaml
 
 if [ ! -s /tmp/vr-api-client.yaml ]; then
   echo "WARNING: Failed to generate Velociraptor API cert — skipping configuration"
@@ -407,5 +412,6 @@ else
 
   # Clean up
   rm -f /tmp/vr-api-client.yaml
+  docker exec velociraptor rm -f /tmp/vr-api-client.yaml 2>/dev/null || true
   echo "Velociraptor configuration complete"
 fi
