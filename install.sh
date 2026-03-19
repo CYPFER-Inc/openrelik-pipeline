@@ -323,7 +323,7 @@ if [ ! -f server.config.yaml ]; then
     "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
-    "Client": {"server_urls": ["https://$IP_ADDRESS:8000/"], "use_self_signed_ssl": true},
+    "Client": {"server_urls": ["${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"], "use_self_signed_ssl": true},
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
 
