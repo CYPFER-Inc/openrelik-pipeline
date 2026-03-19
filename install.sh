@@ -374,3 +374,38 @@ EOF
 
 docker compose build
 docker compose up -d
+
+# Configure Velociraptor via API
+echo "Configuring Velociraptor via API..."
+
+# Wait for Velociraptor API to be ready
+echo "Waiting for Velociraptor API on port 8001..."
+for i in $(seq 1 30); do
+  if docker exec velociraptor nc -z localhost 8001 2>/dev/null; then
+    echo "Velociraptor API is ready"
+    break
+  fi
+  echo "  Waiting... ($i/30)"
+  sleep 10
+done
+
+# Generate API client cert
+docker exec velociraptor /opt/velociraptor \
+  --config /opt/server.config.yaml \
+  config api_client --name ansible > /tmp/vr-api-client.yaml
+
+if [ ! -s /tmp/vr-api-client.yaml ]; then
+  echo "WARNING: Failed to generate Velociraptor API cert — skipping configuration"
+else
+  # Pull and run the config container
+  docker pull ghcr.io/cypfer-inc/openrelik-vr-config:latest
+
+  docker run --rm \
+    --network host \
+    -v /tmp/vr-api-client.yaml:/config/api.yaml:ro \
+    ghcr.io/cypfer-inc/openrelik-vr-config:latest
+
+  # Clean up
+  rm -f /tmp/vr-api-client.yaml
+  echo "Velociraptor configuration complete"
+fi
