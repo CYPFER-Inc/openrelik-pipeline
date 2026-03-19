@@ -54,6 +54,43 @@ fi
 echo "All digest fields verified"
 echo "─────────────────────────────────────────────────"
 
+# ─── Environment validation ───────────────────────────────────────────────────
+ENVIRONMENT=${ENVIRONMENT:-dev}
+echo "Environment: ${ENVIRONMENT}"
+
+if [ "${ENVIRONMENT}" = "prod" ]; then
+  # Production requires public URL variables to be set
+  MISSING_PROD_VARS=()
+  for VAR in CASE_NUMBER TIMESKETCH_PUBLIC_URL OPENRELIK_PUBLIC_URL \
+             VELOCIRAPTOR_PUBLIC_URL VELOCIRAPTOR_CLIENT_URL PIPELINE_PUBLIC_URL; do
+    if [ -z "${!VAR}" ]; then
+      MISSING_PROD_VARS+=("${VAR}")
+    fi
+  done
+
+  if [ ${#MISSING_PROD_VARS[@]} -gt 0 ]; then
+    echo "ERROR: Production mode requires these variables to be set in config.env:"
+    for VAR in "${MISSING_PROD_VARS[@]}"; do
+      echo "       - ${VAR}"
+    done
+    exit 1
+  fi
+  echo "Production environment variables verified"
+
+elif [ "${ENVIRONMENT}" = "dev" ]; then
+  echo "Dev mode — services accessible via direct IP:port"
+  echo "  Timesketch:   http://${IP_ADDRESS}:80"
+  echo "  OpenRelik:    http://${IP_ADDRESS}:8711"
+  echo "  Velociraptor: http://${IP_ADDRESS}:8889"
+  echo "  Pipeline:     http://${IP_ADDRESS}:5000"
+
+else
+  echo "ERROR: ENVIRONMENT must be 'dev' or 'prod' — got '${ENVIRONMENT}'"
+  exit 1
+fi
+echo "─────────────────────────────────────────────────"
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Authenticate to Docker Hub to avoid pull rate limits
 if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   echo "Authenticating to Docker Hub..."
