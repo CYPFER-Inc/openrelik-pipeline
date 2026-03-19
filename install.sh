@@ -242,7 +242,7 @@ sed -i "${insert_line}i\\
       environment:\\
         - REDIS_URL=redis://openrelik-redis:6379\\
         - TIMESKETCH_SERVER_URL=http://timesketch-web:5000\\
-        - TIMESKETCH_SERVER_PUBLIC_URL=http://$IP_ADDRESS\\
+        - TIMESKETCH_SERVER_PUBLIC_URL=${TIMESKETCH_PUBLIC_URL:-http://$IP_ADDRESS}\\
         - TIMESKETCH_USERNAME=admin\\
         - TIMESKETCH_PASSWORD=$TIMESKETCH_PASSWORD\\
       volumes:\\
@@ -311,7 +311,7 @@ if [ ! -f server.config.yaml ]; then
   ./velociraptor config generate > server.config.yaml --merge '{
     "Frontend": {"hostname": "$IP_ADDRESS"},
     "API": {"bind_address": "0.0.0.0"},
-    "GUI": {"public_url": "https://$IP_ADDRESS:8889/app/index.html", "bind_address": "0.0.0.0"},
+    "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
     "Client": {"server_urls": ["https://$IP_ADDRESS:8000/"], "use_self_signed_ssl": true},
