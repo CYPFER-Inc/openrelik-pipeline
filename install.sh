@@ -394,6 +394,11 @@ done
 if ! (echo > /dev/tcp/localhost/8001) 2>/dev/null; then
   echo "WARNING: Velociraptor API not accessible on port 8001 — skipping configuration"
 else
+  # Create ansible API user with admin role
+  docker exec velociraptor /opt/velociraptor \
+  --config /opt/server.config.yaml \
+  user add ansible --role administrator
+
   # Generate API client cert
   docker exec velociraptor /opt/velociraptor \
     --config /opt/server.config.yaml \
