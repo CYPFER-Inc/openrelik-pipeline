@@ -397,7 +397,7 @@ else
   # Create ansible API user with admin role
   docker exec velociraptor /opt/velociraptor \
   --config /opt/server.config.yaml \
-  user add ansible --role administrator "$(openssl rand -base64 16)"
+  user add ansible "$(openssl rand -base64 16)"
   # The password is random and never used 
   # The ansible user authenticates via cert only. 
 
@@ -420,7 +420,7 @@ else
   else
     # Login to GHCR for private image
     if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
-      echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+      echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null
     fi
 
     # Pull and run the config container
