@@ -54,6 +54,9 @@ fi
 echo "All digest fields verified"
 echo "─────────────────────────────────────────────────"
 
+# Create logs directory
+mkdir -p /opt/openrelik-pipeline/logs
+
 # ─── Environment validation ───────────────────────────────────────────────────
 ENVIRONMENT=${ENVIRONMENT:-dev}
 echo "Environment: ${ENVIRONMENT}"
@@ -106,7 +109,7 @@ cd /opt
 echo "Deploying Timesketch..."
 curl -s -O https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
 chmod 755 deploy_timesketch.sh
-./deploy_timesketch.sh <<EOF
+./deploy_timesketch.sh <<EOF 2>&1 | tee /opt/openrelik-pipeline/logs/timesketch-install.log
 Y
 N
 EOF
@@ -154,7 +157,7 @@ curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/do
 sed -i 's/RELEASES=("0.7.0" "0.6.0")/RELEASES=("0.7.0" "0.6.0" "0.7.0-rc.1")/g' install.sh
 
 # Run the installation script unattended — select option 4 (0.7.0-rc.1)
-echo "4" | bash install.sh
+echo "4" | bash install.sh 2>&1 | tee /opt/openrelik-pipeline/logs/openrelik-install.log
 
 # Configure OpenRelik
 echo "Configuring OpenRelik..."
@@ -208,7 +211,8 @@ TABLE_COUNT=$(docker exec openrelik-postgres psql -U openrelik -d openrelik -t -
 if [ -z "$TABLE_COUNT" ] || [ "$TABLE_COUNT" -lt 5 ]; then
   echo "Database tables not found — running migrations..."
   docker exec openrelik-server bash -c \
-    "cd /app/openrelik/datastores/sql && alembic upgrade head"
+    "cd /app/openrelik/datastores/sql && alembic upgrade head" \
+    2>&1 | tee /opt/openrelik-pipeline/logs/alembic-migration.log
   echo "Migrations complete"
 else
   echo "Database tables verified ($TABLE_COUNT tables found)"
@@ -261,7 +265,7 @@ echo "Plaso versions now:"
 dpkg --list | grep plaso || true
 log2timeline.py --version || true
 psort.py --version || true
-'
+' 2>&1 | tee /opt/openrelik-pipeline/logs/plaso-upgrade.log
 
 # Restart the worker so it picks up the new plaso tooling
 docker compose restart openrelik-worker-plaso
@@ -372,7 +376,7 @@ fi
 exec /opt/velociraptor --config /opt/server.config.yaml frontend -v
 EOF
 
-docker compose build
+docker compose build 2>&1 | tee /opt/openrelik-pipeline/logs/velociraptor-build.log
 docker compose up -d
 
 # Configure Velociraptor via API
@@ -430,7 +434,7 @@ else
       --network host \
       -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
       ghcr.io/cypfer-inc/openrelik-vr-config:latest \
-      --api_config /tmp/api.yaml
+      --api_config /tmp/api.yaml 2>&1 | tee /opt/openrelik-pipeline/logs/vr-config.log
 
     # Clean up
     rm -f /tmp/vr-api-client.yaml
