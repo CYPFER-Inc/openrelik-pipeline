@@ -375,43 +375,53 @@ EOF
 docker compose build
 docker compose up -d
 
-# Replace the Velociraptor API configuration section with this:
-
 # Configure Velociraptor via API
 echo "Configuring Velociraptor via API..."
 
-# Wait for Velociraptor API using bash TCP instead of nc
-echo "Waiting for Velociraptor API on port 8001..."
-for i in $(seq 1 30); do
-  if (echo > /dev/tcp/localhost/8001) 2>/dev/null; then
-    echo "Velociraptor API is ready"
+# Wait for Velociraptor binary to be downloaded and API to be ready
+echo "Waiting for Velociraptor to initialise (may take 2-3 minutes on first boot)..."
+for i in $(seq 1 60); do
+  if docker exec velociraptor test -f /opt/server.config.yaml 2>/dev/null; then
+    echo "Velociraptor initialised — server config exists"
+    sleep 15
     break
   fi
-  echo "  Waiting... ($i/30)"
+  echo "  Waiting for initialisation... ($i/60)"
   sleep 10
 done
 
-# Generate API client cert — output to file directly
-docker exec velociraptor /opt/velociraptor \
-  --config /opt/server.config.yaml \
-  config api_client --name ansible --output /tmp/vr-api-client.yaml
-
-# Copy cert out of container to host
-docker cp velociraptor:/tmp/vr-api-client.yaml /tmp/vr-api-client.yaml
-
-if [ ! -s /tmp/vr-api-client.yaml ]; then
-  echo "WARNING: Failed to generate Velociraptor API cert — skipping configuration"
+# Verify API is accessible
+if ! (echo > /dev/tcp/localhost/8001) 2>/dev/null; then
+  echo "WARNING: Velociraptor API not accessible on port 8001 — skipping configuration"
 else
-  # Pull and run the config container
-  docker pull ghcr.io/cypfer-inc/openrelik-vr-config:latest
+  # Generate API client cert
+  docker exec velociraptor /opt/velociraptor \
+    --config /opt/server.config.yaml \
+    config api_client --name ansible /tmp/vr-api-client.yaml
 
-  docker run --rm \
-    --network host \
-    -v /tmp/vr-api-client.yaml:/config/api.yaml:ro \
-    ghcr.io/cypfer-inc/openrelik-vr-config:latest
+  # Copy cert out of container to host
+  docker cp velociraptor:/tmp/vr-api-client.yaml /tmp/vr-api-client.yaml
 
-  # Clean up
-  rm -f /tmp/vr-api-client.yaml
-  docker exec velociraptor rm -f /tmp/vr-api-client.yaml 2>/dev/null || true
-  echo "Velociraptor configuration complete"
+  if [ ! -s /tmp/vr-api-client.yaml ] || [ -d /tmp/vr-api-client.yaml ]; then
+    echo "WARNING: Failed to generate Velociraptor API cert — skipping configuration"
+  else
+    # Login to GHCR for private image
+    if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
+      echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin
+    fi
+
+    # Pull and run the config container
+    docker pull ghcr.io/cypfer-inc/openrelik-vr-config:latest
+
+    docker run --rm \
+      --network host \
+      -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
+      ghcr.io/cypfer-inc/openrelik-vr-config:latest \
+      --api_config /tmp/api.yaml
+
+    # Clean up
+    rm -f /tmp/vr-api-client.yaml
+    docker exec velociraptor rm -f /tmp/vr-api-client.yaml 2>/dev/null || true
+    echo "Velociraptor configuration complete"
+  fi
 fi
