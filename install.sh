@@ -397,7 +397,7 @@ else
   # Create ansible API user with admin role
   docker exec velociraptor /opt/velociraptor \
   --config /opt/server.config.yaml \
-  user add ansible "$(openssl rand -base64 16)"
+  user add ansible --role administrator "$(openssl rand -base64 16)"
   # The password is random and never used 
   # The ansible user authenticates via cert only. 
 
