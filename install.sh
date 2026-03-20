@@ -400,7 +400,13 @@ else
   user add ansible --role administrator "$(openssl rand -base64 16)"
   # The password is random and never used 
   # The ansible user authenticates via cert only. 
-  
+
+  # Restart Velociraptor to pick up new user
+  cd /opt/velociraptor
+  docker compose restart
+  sleep 20
+  cd /opt/openrelik-pipeline
+
   # Generate API client cert
   docker exec velociraptor /opt/velociraptor \
     --config /opt/server.config.yaml \
