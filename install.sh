@@ -109,10 +109,11 @@ cd /opt
 echo "Deploying Timesketch..."
 curl -s -O https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
 chmod 755 deploy_timesketch.sh
-./deploy_timesketch.sh <<EOF /opt/openrelik-pipeline/logs/timesketch-install.log 2>&1
+(./deploy_timesketch.sh <<EOF 
 Y
 N
 EOF
+) > /opt/openrelik-pipeline/logs/timesketch-install.log 2>&1
 
 # Change directory to timesketch
 cd timesketch
