@@ -107,6 +107,7 @@ cd /opt
 
 # Deploy Timesketch
 echo "Deploying Timesketch..."
+echo "Output is being logged, this may take 5-7 minutes"
 curl -s -O https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
 chmod 755 deploy_timesketch.sh
 (./deploy_timesketch.sh <<EOF 
