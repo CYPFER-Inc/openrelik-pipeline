@@ -47,6 +47,7 @@ env:
   UPLOAD_SARIF: "false"  # Set to "true" only if GitHub Advanced Security is enabled on this repo
   # Set to 'false' to allow HIGH CVEs without failing the build
   FAIL_ON_HIGH: "true"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ---------------------------------------------------------------------------

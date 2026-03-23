@@ -41,6 +41,8 @@ env:
   # This avoids GHCR parse errors caused by mixed-case org names like CYPFER-Inc
   # Set to "true" only if GitHub Advanced Security is enabled on this repo (paid feature for private repos)
   UPLOAD_SARIF: "false"  
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 
 jobs:
   # ---------------------------------------------------------------------------
