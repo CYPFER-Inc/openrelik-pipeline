@@ -155,11 +155,8 @@ echo "Deploying OpenRelik..."
 cd /opt
 curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
 
-# Patch the installer to include rc.1 release option
-sed -i 's/RELEASES=("0.7.0" "0.6.0")/RELEASES=("0.7.0" "0.6.0" "0.7.0-rc.1")/g' install.sh
-
 # Run the installation script unattended — select option 4 (0.7.0-rc.1)
-echo "4" | bash install.sh 2>&1 | tee /opt/openrelik-pipeline/logs/openrelik-install.log
+echo "1" | bash install.sh 2>&1 | tee /opt/openrelik-pipeline/logs/openrelik-install.log
 
 # Configure OpenRelik
 echo "Configuring OpenRelik..."
