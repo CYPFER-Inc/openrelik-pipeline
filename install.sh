@@ -427,12 +427,15 @@ else
     fi
 
     # Pull and run the config container
-    docker pull ghcr.io/cypfer-inc/openrelik-vr-config:latest
+
+    VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
+
+    docker pull "${VR_CONFIG_IMAGE}"
 
     docker run --rm \
       --network host \
       -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
-      ghcr.io/cypfer-inc/openrelik-vr-config:latest \
+      "${VR_CONFIG_IMAGE}" \
       --api_config /tmp/api.yaml 2>&1 | tee /opt/openrelik-pipeline/logs/vr-config.log
 
     # Clean up
