@@ -1,19 +1,12 @@
 # openrelik-pipeline
 
 ### Intro
+Note: This version of the repository is designed to work with some private repositories that are specific to Cypfer
+Cloned from: https://github.com/Digital-Defense-Institute/openrelik-pipeline
+
 This repository provides an all-in-one DFIR solution by deploying Timesketch, OpenRelik, Velociraptor, and the custom OpenRelik Pipeline tool via Docker Compose. It allows users to send forensic artifacts (e.g., Windows event logs or full triage acquisitions generated with Velociraptor) to an API endpoint, which triggers a workflow to upload the files to OpenRelik and generate a timeline. Depending on the configuration, the workflow can use log2timeline (Plaso) or Hayabusa to produce the timeline and push it directly into Timesketch. This automated approach streamlines artifact ingestion and analysis, turning what used to be multiple separate processes into a more convenient, “push-button” deployment. 
 
-### To do
-* <del>Add Velociraptor tags into artifacts so timelines from systems tied to an investigation by tags can all be added to the same sketch for that investigation</del>
-
 ### Notes
-* There are PRs/issues to make some tweaks in some of the involved repos. 
-    * [Fix timeline names for Hayabusa CSV timelines](https://github.com/openrelik/openrelik-worker-hayabusa/issues/4)
-    * <del>[Allow users to provide the name of the sketch they want timelines to be part of if it exists instead of just the ID](https://github.com/openrelik/openrelik-worker-timesketch/pull/8)</del>
-    * <del>[Ability to set the OpenRelik admin password via an environment variable](https://github.com/openrelik/openrelik-deploy/pull/11)</del>
-    * <del>[Ability to create an OpenRelik API key without authing in the web UI](https://github.com/openrelik/openrelik-server/issues/62)
-        * This is the main reason manual intervention is required right now and that this cannot be fully scripted. You must log into the OpenRelik web UI in order to generate an API key, and then manually update your `docker-compose.yml` file for the pipeline to work.</del>
-    * <del>[Fix for generating a custom Timesketch sketch name vs an auto-generated name](https://github.com/openrelik/openrelik-worker-timesketch/pull/4)</del>
 
 ### Known Bugs
 * [Timesketch postgres race condition](https://github.com/google/timesketch/issues/3263)
@@ -23,18 +16,21 @@ This repository provides an all-in-one DFIR solution by deploying Timesketch, Op
 ### Step 1 - Install Docker 
 Follow the official installation instructions to [install Docker Engine](https://docs.docker.com/engine/install/).
 
-### Step 2 - Clone the project and set environment variables
+### Step 2 - Clone the project and add a config.env file with details
+### The detailed file will be provided to you if you are allowed access 
 ```bash
 sudo -i
-git clone https://github.com/Digital-Defense-Institute/openrelik-pipeline.git /opt/openrelik-pipeline
+git clone https://github.com/CYPFER-Inc/openrelik-pipeline.git /opt/openrelik-pipeline
 ```
+Copy the config.env file into the /opt/openrelik-pipeline directory
+
+Change the `ENVIRONMENT` to dev (default)
+
 Change `IP_ADDRESS` to your public or IPv4 address if deploying on a cloud server, a VM (the IP of the VM), or WSL (the IP of WSL).
-```
-export TIMESKETCH_PASSWORD="YOUR_DESIRED_TIMESKETCH_PASSWORD"
-export VELOCIRAPTOR_PASSWORD="YOUR_DESIRED_VELOCIRAPTOR_PASSWORD"
-export OPENRELIK_ADMIN_PASSWORD="YOUR_DESIRED_OPENRELIK_PASSWORD"
-export IP_ADDRESS="0.0.0.0" 
-```
+
+Change the `Credentials` section for passwords
+
+Optionally change the `VR_CONFIG_IMAGE` to point at a feature branch (defaults to :latest)
 
 ### Step 3 - Run the install script to deploy Timesketch, OpenRelik, Velociraptor, and the OpenRelik Pipeline
 Depending on your connection, this can take 5-10 minutes.
