@@ -161,6 +161,12 @@ if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   }
 fi
 
+# Source GHCR credentials for private image pulls
+if [ -f "./config.env" ]; then
+    set -a; source ./config.env; set +a
+fi
+
+
 cd /opt
 
 # ─── Timesketch ───────────────────────────────────────────────────────────────
@@ -294,8 +300,22 @@ psort.py --version || true
 
   OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "demo")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
-  sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
+  sed -i "#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
 
+  export OPENRELIK_API_KEY
+
+  # Run OpenRelik post-install configuration (workers, workflows, folders)
+  echo "Running OpenRelik post-install configuration..."
+  if [ -f "/opt/openrelik-or-config/install-hook.sh" ]; then
+    source /opt/openrelik-or-config/install-hook.sh
+    run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
+  else
+    # Clone and run if not already present
+    git clone https://github.com/CYPFER-Inc/openrelik-or-config.git \
+        /opt/openrelik-or-config
+    source /opt/openrelik-or-config/install-hook.sh
+    run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
+  
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
   insert_line=$((line - 1))
