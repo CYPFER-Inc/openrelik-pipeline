@@ -292,26 +292,35 @@ psort.py --version || true
 
   docker compose restart openrelik-worker-plaso
 
-  # FIX 1: was missing leading 's' in sed substitution expression
+  # FIX 1: was missing leading 's' in sed expression
   OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "demo")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
   sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
 
   export OPENRELIK_API_KEY
 
-  # ── OpenRelik post-install configuration (workers, workflows, folders) ──────
+  # Authenticate to GHCR for private image pulls
+  # Uses same GHCR_USER / GHCR_TOKEN as vr-config — no separate secret needed
+  if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
+    echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
+      && echo "GHCR login successful" \
+      || echo "WARNING: GHCR login failed — or-config image pull may fail"
+  else
+    echo "WARNING: GHCR_USER or GHCR_TOKEN not set in config.env — skipping GHCR login"
+  fi
+
+  # Run OpenRelik post-install configuration (workers, workflows, folders)
   echo "Running OpenRelik post-install configuration..."
   if [ -f "/opt/openrelik-or-config/install-hook.sh" ]; then
     source /opt/openrelik-or-config/install-hook.sh
     run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
   else
-    # Clone if not already present on disk
+    # Clone and run if not already present
     git clone https://github.com/CYPFER-Inc/openrelik-or-config.git \
         /opt/openrelik-or-config
     source /opt/openrelik-or-config/install-hook.sh
     run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
   fi
-  # FIX 2: fi was missing here — everything below was inside the else branch
 
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
@@ -320,7 +329,7 @@ psort.py --version || true
   TIMESKETCH_WORKER_DIGEST=$(grep OPENRELIK_WORKER_TIMESKETCH_DIGEST /opt/openrelik-pipeline/config.env | cut -d= -f2)
 
   sed -i "${insert_line}i\\
-\\
+  \\
   openrelik-worker-timesketch:\\
       container_name: openrelik-worker-timesketch\\
       image: ghcr.io/openrelik/openrelik-worker-timesketch@${TIMESKETCH_WORKER_DIGEST}\\
