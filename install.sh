@@ -117,6 +117,28 @@ fi
 echo "All digest fields verified"
 echo "─────────────────────────────────────────────────"
 
+# ─── IP address detection ─────────────────────────────────────────────────────────────────────────
+# If IP_ADDRESS is already set in config.env it is used as-is (manual override).
+# Otherwise auto-detect from the primary non-loopback IPv4 interface.
+if [ -z "${IP_ADDRESS:-}" ]; then
+  IP_ADDRESS=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+  # Fallback: first non-loopback IPv4 from ip addr
+  if [ -z "$IP_ADDRESS" ]; then
+    IP_ADDRESS=$(ip -4 addr show scope global | awk '/inet / {split($2,a,"/"); print a[1]}' | head -1)
+  fi
+  # Last resort fallback
+  if [ -z "$IP_ADDRESS" ]; then
+    IP_ADDRESS="127.0.0.1"
+    echo "WARNING: Could not auto-detect IP address, falling back to 127.0.0.1"
+    echo "         Set IP_ADDRESS in config.env to override"
+  else
+    echo "Auto-detected IP address: ${IP_ADDRESS}"
+  fi
+else
+  echo "Using IP address from config.env: ${IP_ADDRESS}"
+fi
+export IP_ADDRESS
+
 mkdir -p /opt/openrelik-pipeline/logs
 
 # ─── Environment validation ───────────────────────────────────────────────────
@@ -310,17 +332,24 @@ psort.py --version || true
   fi
 
   # Run OpenRelik post-install configuration (workers, workflows, folders)
+  # Mirrors vr-config exactly: pull image from GHCR, run once, remove container.
+  # No git clone required — config is baked into the image at build time.
   echo "Running OpenRelik post-install configuration..."
-  if [ -f "/opt/openrelik-or-config/install-hook.sh" ]; then
-    source /opt/openrelik-or-config/install-hook.sh
-    run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
-  else
-    # Clone and run if not already present
-    git clone "https://${GHCR_USER}:${GHCR_TOKEN}@github.com/CYPFER-Inc/openrelik-or-config.git" \
-      /opt/openrelik-or-config
-    source /opt/openrelik-or-config/install-hook.sh
-    run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
-  fi
+
+  OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
+  docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log
+
+  docker run --rm \
+    --name openrelik-configure \
+    --network openrelik_default \
+    -e OPENRELIK_API_URL="http://openrelik-server:8710" \
+    -e OPENRELIK_API_KEY="${OPENRELIK_API_KEY}" \
+    -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
+    -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
+    "${OR_CONFIG_IMAGE}" \
+    2>&1 | tee /opt/openrelik-pipeline/logs/or-config.log \
+    || echo "WARNING: OpenRelik configure step failed — continuing install."
+
 
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
