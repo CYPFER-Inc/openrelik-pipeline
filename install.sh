@@ -316,8 +316,8 @@ psort.py --version || true
     run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
   else
     # Clone and run if not already present
-    git clone https://github.com/CYPFER-Inc/openrelik-or-config.git \
-        /opt/openrelik-or-config
+    git clone "https://${GHCR_USER}:${GHCR_TOKEN}@github.com/CYPFER-Inc/openrelik-or-config.git" \
+      /opt/openrelik-or-config
     source /opt/openrelik-or-config/install-hook.sh
     run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
   fi
