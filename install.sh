@@ -161,12 +161,6 @@ if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   }
 fi
 
-# Source GHCR credentials for private image pulls
-if [ -f "./config.env" ]; then
-    set -a; source ./config.env; set +a
-fi
-
-
 cd /opt
 
 # ─── Timesketch ───────────────────────────────────────────────────────────────
@@ -298,24 +292,27 @@ psort.py --version || true
 
   docker compose restart openrelik-worker-plaso
 
+  # FIX 1: was missing leading 's' in sed substitution expression
   OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "demo")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
-  sed -i "#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
+  sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
 
   export OPENRELIK_API_KEY
 
-  # Run OpenRelik post-install configuration (workers, workflows, folders)
+  # ── OpenRelik post-install configuration (workers, workflows, folders) ──────
   echo "Running OpenRelik post-install configuration..."
   if [ -f "/opt/openrelik-or-config/install-hook.sh" ]; then
     source /opt/openrelik-or-config/install-hook.sh
     run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
   else
-    # Clone and run if not already present
+    # Clone if not already present on disk
     git clone https://github.com/CYPFER-Inc/openrelik-or-config.git \
         /opt/openrelik-or-config
     source /opt/openrelik-or-config/install-hook.sh
     run_openrelik_configure || echo "WARNING: OpenRelik configure step failed — continuing install."
-  
+  fi
+  # FIX 2: fi was missing here — everything below was inside the else branch
+
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
   insert_line=$((line - 1))
@@ -323,7 +320,7 @@ psort.py --version || true
   TIMESKETCH_WORKER_DIGEST=$(grep OPENRELIK_WORKER_TIMESKETCH_DIGEST /opt/openrelik-pipeline/config.env | cut -d= -f2)
 
   sed -i "${insert_line}i\\
-  \\
+\\
   openrelik-worker-timesketch:\\
       container_name: openrelik-worker-timesketch\\
       image: ghcr.io/openrelik/openrelik-worker-timesketch@${TIMESKETCH_WORKER_DIGEST}\\
