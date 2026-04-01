@@ -315,11 +315,24 @@ psort.py --version || true
   docker compose restart openrelik-worker-plaso
 
   # FIX 1: was missing leading 's' in sed expression
-  OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "demo")"
+  # NOTE: admin.py create-api-key generates a REFRESH TOKEN not a Bearer JWT.
+  # configure.py exchanges it for an access token via /auth/refresh before API calls.
+  OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
   sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
 
+  # Persist key to config.env and key file so configure container and rotation cron can use it
+  if grep -q "^OPENRELIK_API_KEY=" /opt/openrelik-pipeline/config.env 2>/dev/null; then
+    sed -i "s#^OPENRELIK_API_KEY=.*#OPENRELIK_API_KEY=${OPENRELIK_API_KEY}#" /opt/openrelik-pipeline/config.env
+  else
+    echo "OPENRELIK_API_KEY=${OPENRELIK_API_KEY}" >> /opt/openrelik-pipeline/config.env
+  fi
+  echo "${OPENRELIK_API_KEY}" > /opt/openrelik-pipeline/.openrelik_api_key
+  chmod 600 /opt/openrelik-pipeline/.openrelik_api_key
+  echo "API key saved to config.env and .openrelik_api_key"
+
   export OPENRELIK_API_KEY
+
 
   # Authenticate to GHCR for private image pulls
   # Uses same GHCR_USER / GHCR_TOKEN as vr-config — no separate secret needed
@@ -343,7 +356,8 @@ psort.py --version || true
     --name openrelik-configure \
     --network openrelik_default \
     -e OPENRELIK_API_URL="http://openrelik-server:8710" \
-    -e OPENRELIK_API_KEY="${OPENRELIK_API_KEY}" \
+    -e OPENRELIK_USERNAME="admin" \
+    -e OPENRELIK_PASSWORD="${OPENRELIK_ADMIN_PASSWORD}" \
     -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
     -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
     "${OR_CONFIG_IMAGE}" \
