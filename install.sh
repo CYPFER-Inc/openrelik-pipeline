@@ -375,7 +375,16 @@ psort.py --version || true
 " docker-compose.yml
 
   docker network connect openrelik_default timesketch-web
-  docker compose up -d
+  # Connect timesketch-web to the openrelik network
+  # The container lives in the timesketch compose project, not openrelik
+  if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
+    docker network connect openrelik_default timesketch-web 2>/dev/null \
+      && echo "timesketch-web connected to openrelik_default" \
+      || echo "WARNING: timesketch-web already on openrelik_default or connect failed"
+  else
+    echo "WARNING: timesketch-web container not found — skipping network connect"
+    echo "         Ensure Timesketch is deployed before OpenRelik for full integration"
+  fi
 
   docker network disconnect openrelik_default openrelik-pipeline 2>/dev/null || true
   docker rm -f openrelik-pipeline 2>/dev/null || true
