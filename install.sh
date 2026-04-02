@@ -361,6 +361,8 @@ psort.py --version || true
     -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
     -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
     -e OPENRELIK_COMPOSE="/opt/openrelik/docker-compose.yml" \
+    -e GHCR_USER="${GHCR_USER}" \
+    -e GHCR_TOKEN="${GHCR_TOKEN}" \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /opt/openrelik:/opt/openrelik \
     "${OR_CONFIG_IMAGE}" \
