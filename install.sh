@@ -360,6 +360,9 @@ psort.py --version || true
     -e OPENRELIK_PASSWORD="${OPENRELIK_ADMIN_PASSWORD}" \
     -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
     -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
+    -e OPENRELIK_COMPOSE="/opt/openrelik/docker-compose.yml" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /opt/openrelik:/opt/openrelik \
     "${OR_CONFIG_IMAGE}" \
     2>&1 | tee /opt/openrelik-pipeline/logs/or-config.log \
     || echo "WARNING: OpenRelik configure step failed — continuing install."
