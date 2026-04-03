@@ -117,6 +117,28 @@ fi
 echo "All digest fields verified"
 echo "─────────────────────────────────────────────────"
 
+# ─── IP address detection ─────────────────────────────────────────────────────────────────────────
+# If IP_ADDRESS is already set in config.env it is used as-is (manual override).
+# Otherwise auto-detect from the primary non-loopback IPv4 interface.
+if [ -z "${IP_ADDRESS:-}" ]; then
+  IP_ADDRESS=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
+  # Fallback: first non-loopback IPv4 from ip addr
+  if [ -z "$IP_ADDRESS" ]; then
+    IP_ADDRESS=$(ip -4 addr show scope global | awk '/inet / {split($2,a,"/"); print a[1]}' | head -1)
+  fi
+  # Last resort fallback
+  if [ -z "$IP_ADDRESS" ]; then
+    IP_ADDRESS="127.0.0.1"
+    echo "WARNING: Could not auto-detect IP address, falling back to 127.0.0.1"
+    echo "         Set IP_ADDRESS in config.env to override"
+  else
+    echo "Auto-detected IP address: ${IP_ADDRESS}"
+  fi
+else
+  echo "Using IP address from config.env: ${IP_ADDRESS}"
+fi
+export IP_ADDRESS
+
 mkdir -p /opt/openrelik-pipeline/logs
 
 # ─── Environment validation ───────────────────────────────────────────────────
@@ -292,9 +314,61 @@ psort.py --version || true
 
   docker compose restart openrelik-worker-plaso
 
-  OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "demo")"
+  # FIX 1: was missing leading 's' in sed expression
+  # NOTE: admin.py create-api-key generates a REFRESH TOKEN not a Bearer JWT.
+  # configure.py exchanges it for an access token via /auth/refresh before API calls.
+  OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
   sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
+
+  # Persist key to config.env and key file so configure container and rotation cron can use it
+  if grep -q "^OPENRELIK_API_KEY=" /opt/openrelik-pipeline/config.env 2>/dev/null; then
+    sed -i "s#^OPENRELIK_API_KEY=.*#OPENRELIK_API_KEY=${OPENRELIK_API_KEY}#" /opt/openrelik-pipeline/config.env
+  else
+    echo "OPENRELIK_API_KEY=${OPENRELIK_API_KEY}" >> /opt/openrelik-pipeline/config.env
+  fi
+  echo "${OPENRELIK_API_KEY}" > /opt/openrelik-pipeline/.openrelik_api_key
+  chmod 600 /opt/openrelik-pipeline/.openrelik_api_key
+  echo "API key saved to config.env and .openrelik_api_key"
+
+  export OPENRELIK_API_KEY
+
+
+  # Authenticate to GHCR for private image pulls
+  # Uses same GHCR_USER / GHCR_TOKEN as vr-config — no separate secret needed
+  if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
+    echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
+      && echo "GHCR login successful" \
+      || echo "WARNING: GHCR login failed — or-config image pull may fail"
+  else
+    echo "WARNING: GHCR_USER or GHCR_TOKEN not set in config.env — skipping GHCR login"
+  fi
+
+  # Run OpenRelik post-install configuration (workers, workflows, folders)
+  # Mirrors vr-config exactly: pull image from GHCR, run once, remove container.
+  # No git clone required — config is baked into the image at build time.
+  echo "Running OpenRelik post-install configuration..."
+
+  OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
+  docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log
+
+  docker run --rm \
+    --name openrelik-configure \
+    --network openrelik_default \
+    -e OPENRELIK_API_URL="http://openrelik-server:8710" \
+    -e OPENRELIK_USERNAME="admin" \
+    -e OPENRELIK_PASSWORD="${OPENRELIK_ADMIN_PASSWORD}" \
+    -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
+    -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
+    -e OPENRELIK_COMPOSE="/opt/openrelik/docker-compose.yml" \
+    -e GHCR_USER="${GHCR_USER}" \
+    -e GHCR_TOKEN="${GHCR_TOKEN}" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v /opt/openrelik:/opt/openrelik \
+    "${OR_CONFIG_IMAGE}" \
+    2>&1 | tee /opt/openrelik-pipeline/logs/or-config.log \
+    || echo "WARNING: OpenRelik configure step failed — continuing install."
+
 
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
@@ -320,7 +394,16 @@ psort.py --version || true
 " docker-compose.yml
 
   docker network connect openrelik_default timesketch-web
-  docker compose up -d
+  # Connect timesketch-web to the openrelik network
+  # The container lives in the timesketch compose project, not openrelik
+  if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
+    docker network connect openrelik_default timesketch-web 2>/dev/null \
+      && echo "timesketch-web connected to openrelik_default" \
+      || echo "WARNING: timesketch-web already on openrelik_default or connect failed"
+  else
+    echo "WARNING: timesketch-web container not found — skipping network connect"
+    echo "         Ensure Timesketch is deployed before OpenRelik for full integration"
+  fi
 
   docker network disconnect openrelik_default openrelik-pipeline 2>/dev/null || true
   docker rm -f openrelik-pipeline 2>/dev/null || true
