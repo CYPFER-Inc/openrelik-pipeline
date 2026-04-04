@@ -359,7 +359,7 @@ psort.py --version || true
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /opt/openrelik:/opt/openrelik \
     "${OR_CONFIG_IMAGE}" \
-    2>&1 | tee /opt/openrelik-pipeline/logs/or-config.log \
+    2> >(tee /opt/openrelik-pipeline/logs/or-config.log >&2) \
     || echo "WARNING: OpenRelik configure step failed — continuing install."
 
   echo "Deploying OpenRelik Timesketch worker..."
@@ -450,9 +450,9 @@ if [ "${INSTALL_TS}" = "true" ]; then
     -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
     -v /var/run/docker.sock:/var/run/docker.sock \
     "${TS_CONFIG_IMAGE}" \
-    2>&1 | tee /opt/openrelik-pipeline/logs/ts-config.log
+    2> >(tee /opt/openrelik-pipeline/logs/ts-config.log >&2)
 
-  TS_CONFIG_EXIT=${PIPESTATUS[0]}
+  TS_CONFIG_EXIT=$?
   if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
     echo "Timesketch configuration complete"
   else
@@ -571,7 +571,7 @@ EOF
         --network host \
         -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
         "${VR_CONFIG_IMAGE}" \
-        --api_config /tmp/api.yaml 2>&1 | tee /opt/openrelik-pipeline/logs/vr-config.log
+        --api_config /tmp/api.yaml 2> >(tee /opt/openrelik-pipeline/logs/vr-config.log >&2)
 
       rm -f /tmp/vr-api-client.yaml
       docker exec velociraptor rm -f /tmp/vr-api-client.yaml 2>/dev/null || true
