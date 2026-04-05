@@ -196,7 +196,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
 Y
 N
 EOF
-  ) > /opt/openrelik-pipeline/logs/timesketch-install.log 2>&1
+  ) 2>/opt/openrelik-pipeline/logs/timesketch-install.log
 
   cd timesketch
 
