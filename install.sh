@@ -632,6 +632,14 @@ EOF
     fi
   fi
 
+  # Connect Velociraptor to OpenRelik network so the server artifact
+  # can POST collections to openrelik-pipeline:5000
+  if [ "${INSTALL_OR}" = "true" ]; then
+    docker network connect openrelik_default velociraptor 2>/dev/null \
+      && echo "velociraptor connected to openrelik_default" \
+      || echo "WARNING: velociraptor already on openrelik_default or connect failed"
+  fi
+
   echo "Velociraptor deployment complete"
 fi
 
