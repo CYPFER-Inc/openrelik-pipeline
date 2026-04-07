@@ -398,10 +398,31 @@ psort.py --version || true
   docker network disconnect openrelik_default openrelik-pipeline 2>/dev/null || true
   docker rm -f openrelik-pipeline 2>/dev/null || true
 
+  # Verify Timesketch worker was injected into docker-compose.yml
+  if grep -q "openrelik-worker-timesketch" /opt/openrelik/docker-compose.yml 2>/dev/null; then
+    echo "Timesketch worker verified in docker-compose.yml"
+  else
+    echo "WARNING: openrelik-worker-timesketch not found in docker-compose.yml"
+    echo "         The 'Upload to Timesketch' task will not be available"
+    echo "         Check sed injection above for errors"
+  fi
+
   echo "Deploying the OpenRelik pipeline..."
   cd /opt/openrelik-pipeline
   docker compose pull
   docker compose up -d
+
+  # Start the Timesketch worker from the OpenRelik compose
+  cd /opt/openrelik
+  docker compose up -d openrelik-worker-timesketch 2>/dev/null
+
+  # Verify it's running
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-timesketch"; then
+    echo "openrelik-worker-timesketch is running"
+  else
+    echo "WARNING: openrelik-worker-timesketch failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-timesketch"
+  fi
 
   echo "OpenRelik deployment complete"
 fi
