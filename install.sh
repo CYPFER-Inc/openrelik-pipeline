@@ -117,7 +117,7 @@ fi
 echo "All digest fields verified"
 echo "─────────────────────────────────────────────────"
 
-# ─── IP address detection ─────────────────────────────────────────────────────────────────────────
+# ─── IP address detection ─────────────────────────────────────────────────────
 # If IP_ADDRESS is already set in config.env it is used as-is (manual override).
 # Otherwise auto-detect from the primary non-loopback IPv4 interface.
 if [ -z "${IP_ADDRESS:-}" ]; then
@@ -196,7 +196,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
 Y
 N
 EOF
-  ) > /opt/openrelik-pipeline/logs/timesketch-install.log 2>&1
+  ) 2>/opt/openrelik-pipeline/logs/timesketch-install.log
 
   cd timesketch
 
@@ -314,9 +314,6 @@ psort.py --version || true
 
   docker compose restart openrelik-worker-plaso
 
-  # FIX 1: was missing leading 's' in sed expression
-  # NOTE: admin.py create-api-key generates a REFRESH TOKEN not a Bearer JWT.
-  # configure.py exchanges it for an access token via /auth/refresh before API calls.
   OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
   sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
@@ -333,9 +330,7 @@ psort.py --version || true
 
   export OPENRELIK_API_KEY
 
-
   # Authenticate to GHCR for private image pulls
-  # Uses same GHCR_USER / GHCR_TOKEN as vr-config — no separate secret needed
   if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
     echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
       && echo "GHCR login successful" \
@@ -345,8 +340,6 @@ psort.py --version || true
   fi
 
   # Run OpenRelik post-install configuration (workers, workflows, folders)
-  # Mirrors vr-config exactly: pull image from GHCR, run once, remove container.
-  # No git clone required — config is baked into the image at build time.
   echo "Running OpenRelik post-install configuration..."
 
   OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
@@ -366,9 +359,8 @@ psort.py --version || true
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /opt/openrelik:/opt/openrelik \
     "${OR_CONFIG_IMAGE}" \
-    2>&1 | tee /opt/openrelik-pipeline/logs/or-config.log \
+    2>/opt/openrelik-pipeline/logs/or-config.log \
     || echo "WARNING: OpenRelik configure step failed — continuing install."
-
 
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
@@ -393,9 +385,7 @@ psort.py --version || true
       command: \"celery --app=src.app worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-timesketch\"
 " docker-compose.yml
 
-  docker network connect openrelik_default timesketch-web
   # Connect timesketch-web to the openrelik network
-  # The container lives in the timesketch compose project, not openrelik
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
     docker network connect openrelik_default timesketch-web 2>/dev/null \
       && echo "timesketch-web connected to openrelik_default" \
@@ -408,12 +398,90 @@ psort.py --version || true
   docker network disconnect openrelik_default openrelik-pipeline 2>/dev/null || true
   docker rm -f openrelik-pipeline 2>/dev/null || true
 
+  # Verify Timesketch worker was injected into docker-compose.yml
+  if grep -q "openrelik-worker-timesketch" /opt/openrelik/docker-compose.yml 2>/dev/null; then
+    echo "Timesketch worker verified in docker-compose.yml"
+  else
+    echo "WARNING: openrelik-worker-timesketch not found in docker-compose.yml"
+    echo "         The 'Upload to Timesketch' task will not be available"
+    echo "         Check sed injection above for errors"
+  fi
+
   echo "Deploying the OpenRelik pipeline..."
   cd /opt/openrelik-pipeline
   docker compose pull
   docker compose up -d
 
+  # Start the Timesketch worker from the OpenRelik compose
+  cd /opt/openrelik
+  docker compose up -d openrelik-worker-timesketch 2>/dev/null
+
+  # Verify it's running
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-timesketch"; then
+    echo "openrelik-worker-timesketch is running"
+  else
+    echo "WARNING: openrelik-worker-timesketch failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-timesketch"
+  fi
+
   echo "OpenRelik deployment complete"
+fi
+
+# ─── Timesketch post-install configuration ────────────────────────────────────
+if [ "${INSTALL_TS}" = "true" ]; then
+  echo "═══════════════════════════════════════════════════"
+  echo "Running Timesketch post-install configuration..."
+
+  TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
+  TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
+
+  # GHCR login — shared token with vr-config and or-config
+  if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
+    echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
+      && echo "GHCR login successful" \
+      || echo "WARNING: GHCR login failed — ts-config image pull may fail"
+  else
+    echo "WARNING: GHCR_USER or GHCR_TOKEN not set — skipping GHCR login"
+  fi
+
+  echo "  Pulling ts-config image: ${TS_CONFIG_IMAGE}"
+  docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log
+
+  # Determine the correct Timesketch network
+  # When OR is also installed timesketch-web has been connected to openrelik_default.
+  # When TS is installed standalone the native timesketch_default network is used.
+  if [ "${INSTALL_OR}" = "true" ]; then
+    TS_NETWORK="openrelik_default"
+  else
+    TS_NETWORK="timesketch_default"
+  fi
+
+  echo "  Starting ts-config (network: ${TS_NETWORK})..."
+  docker run --rm \
+    --name timesketch-configure \
+    --network "${TS_NETWORK}" \
+    -e TS_URL="http://timesketch-web:5000" \
+    -e TS_USERNAME="admin" \
+    -e TS_PASSWORD="${TIMESKETCH_PASSWORD}" \
+    -e TS_CONTAINER="timesketch-web" \
+    -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
+    -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
+    -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
+    -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-120}" \
+    -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    "${TS_CONFIG_IMAGE}" \
+    2>/opt/openrelik-pipeline/logs/ts-config.log
+
+  TS_CONFIG_EXIT=$?
+  if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
+    echo "Timesketch configuration complete"
+  else
+    echo "WARNING: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
+    echo "         /opt/openrelik-pipeline/logs/ts-config.log"
+    echo "         The platform is still running. Re-run manually if needed:"
+    echo "         docker run --rm --network ${TS_NETWORK} ... ${TS_CONFIG_IMAGE}"
+  fi
 fi
 
 # ─── Velociraptor ─────────────────────────────────────────────────────────────
@@ -524,7 +592,7 @@ EOF
         --network host \
         -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
         "${VR_CONFIG_IMAGE}" \
-        --api_config /tmp/api.yaml 2>&1 | tee /opt/openrelik-pipeline/logs/vr-config.log
+        --api_config /tmp/api.yaml 2>/opt/openrelik-pipeline/logs/vr-config.log
 
       rm -f /tmp/vr-api-client.yaml
       docker exec velociraptor rm -f /tmp/vr-api-client.yaml 2>/dev/null || true
