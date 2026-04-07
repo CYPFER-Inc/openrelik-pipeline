@@ -343,24 +343,36 @@ psort.py --version || true
   echo "Running OpenRelik post-install configuration..."
 
   OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
-  docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log
+  if ! docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
+    echo "ERROR: Failed to pull or-config image — skipping OpenRelik configuration"
+    echo "       Check GHCR credentials and image name: ${OR_CONFIG_IMAGE}"
+    OR_CONFIG_FAILED=true
+  fi
 
-  docker run --rm \
-    --name openrelik-configure \
-    --network openrelik_default \
-    -e OPENRELIK_API_URL="http://openrelik-server:8710" \
-    -e OPENRELIK_USERNAME="admin" \
-    -e OPENRELIK_PASSWORD="${OPENRELIK_ADMIN_PASSWORD}" \
-    -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
-    -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
-    -e OPENRELIK_COMPOSE="/opt/openrelik/docker-compose.yml" \
-    -e GHCR_USER="${GHCR_USER}" \
-    -e GHCR_TOKEN="${GHCR_TOKEN}" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    -v /opt/openrelik:/opt/openrelik \
-    "${OR_CONFIG_IMAGE}" \
-    2>/opt/openrelik-pipeline/logs/or-config.log \
-    || echo "WARNING: OpenRelik configure step failed — continuing install."
+  if [ "${OR_CONFIG_FAILED:-}" = "true" ]; then
+    echo "  Skipping or-config run — image pull failed"
+  else
+    docker run --rm \
+      --name openrelik-configure \
+      --network openrelik_default \
+      -e OPENRELIK_API_URL="http://openrelik-server:8710" \
+      -e OPENRELIK_USERNAME="admin" \
+      -e OPENRELIK_PASSWORD="${OPENRELIK_ADMIN_PASSWORD}" \
+      -e OPENRELIK_WAIT_TIMEOUT="${OPENRELIK_WAIT_TIMEOUT:-120}" \
+      -e OPENRELIK_WAIT_INTERVAL="${OPENRELIK_WAIT_INTERVAL:-5}" \
+      -e OPENRELIK_COMPOSE="/opt/openrelik/docker-compose.yml" \
+      -e GHCR_USER="${GHCR_USER}" \
+      -e GHCR_TOKEN="${GHCR_TOKEN}" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      -v /opt/openrelik:/opt/openrelik \
+      "${OR_CONFIG_IMAGE}" \
+      2>/opt/openrelik-pipeline/logs/or-config.log
+
+    if [ $? -ne 0 ]; then
+      echo "ERROR: OpenRelik configuration failed — check /opt/openrelik-pipeline/logs/or-config.log"
+      OR_CONFIG_FAILED=true
+    fi
+  fi
 
   echo "Deploying OpenRelik Timesketch worker..."
   line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
@@ -445,7 +457,11 @@ if [ "${INSTALL_TS}" = "true" ]; then
   fi
 
   echo "  Pulling ts-config image: ${TS_CONFIG_IMAGE}"
-  docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log
+  if ! docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
+    echo "ERROR: Failed to pull ts-config image — skipping Timesketch configuration"
+    echo "       Check GHCR credentials and image name: ${TS_CONFIG_IMAGE}"
+    TS_CONFIG_FAILED=true
+  fi
 
   # Determine the correct Timesketch network
   # When OR is also installed timesketch-web has been connected to openrelik_default.
@@ -456,31 +472,34 @@ if [ "${INSTALL_TS}" = "true" ]; then
     TS_NETWORK="timesketch_default"
   fi
 
-  echo "  Starting ts-config (network: ${TS_NETWORK})..."
-  docker run --rm \
-    --name timesketch-configure \
-    --network "${TS_NETWORK}" \
-    -e TS_URL="http://timesketch-web:5000" \
-    -e TS_USERNAME="admin" \
-    -e TS_PASSWORD="${TIMESKETCH_PASSWORD}" \
-    -e TS_CONTAINER="timesketch-web" \
-    -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
-    -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
-    -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
-    -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-120}" \
-    -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
-    -v /var/run/docker.sock:/var/run/docker.sock \
-    "${TS_CONFIG_IMAGE}" \
-    2>/opt/openrelik-pipeline/logs/ts-config.log
-
-  TS_CONFIG_EXIT=$?
-  if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
-    echo "Timesketch configuration complete"
+  if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
+    echo "  Skipping ts-config run — image pull failed"
   else
-    echo "WARNING: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
-    echo "         /opt/openrelik-pipeline/logs/ts-config.log"
-    echo "         The platform is still running. Re-run manually if needed:"
-    echo "         docker run --rm --network ${TS_NETWORK} ... ${TS_CONFIG_IMAGE}"
+    echo "  Starting ts-config (network: ${TS_NETWORK})..."
+    docker run --rm \
+      --name timesketch-configure \
+      --network "${TS_NETWORK}" \
+      -e TS_URL="http://timesketch-web:5000" \
+      -e TS_USERNAME="admin" \
+      -e TS_PASSWORD="${TIMESKETCH_PASSWORD}" \
+      -e TS_CONTAINER="timesketch-web" \
+      -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
+      -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
+      -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
+      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-120}" \
+      -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      "${TS_CONFIG_IMAGE}" \
+      2>/opt/openrelik-pipeline/logs/ts-config.log
+
+    TS_CONFIG_EXIT=$?
+    if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
+      echo "Timesketch configuration complete"
+    else
+      echo "ERROR: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
+      echo "       /opt/openrelik-pipeline/logs/ts-config.log"
+      TS_CONFIG_FAILED=true
+    fi
   fi
 fi
 
@@ -586,13 +605,26 @@ EOF
       fi
 
       VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
-      docker pull "${VR_CONFIG_IMAGE}"
+      if ! docker pull "${VR_CONFIG_IMAGE}"; then
+        echo "ERROR: Failed to pull vr-config image — skipping Velociraptor configuration"
+        echo "       Check GHCR credentials and image name: ${VR_CONFIG_IMAGE}"
+        VR_CONFIG_FAILED=true
+      fi
 
-      docker run --rm \
-        --network host \
-        -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
-        "${VR_CONFIG_IMAGE}" \
-        --api_config /tmp/api.yaml 2>/opt/openrelik-pipeline/logs/vr-config.log
+      if [ "${VR_CONFIG_FAILED:-}" = "true" ]; then
+        echo "  Skipping vr-config run — image pull failed"
+      else
+        docker run --rm \
+          --network host \
+          -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
+          "${VR_CONFIG_IMAGE}" \
+          --api_config /tmp/api.yaml 2>/opt/openrelik-pipeline/logs/vr-config.log
+
+        if [ $? -ne 0 ]; then
+          echo "ERROR: Velociraptor configuration failed — check /opt/openrelik-pipeline/logs/vr-config.log"
+          VR_CONFIG_FAILED=true
+        fi
+      fi
 
       rm -f /tmp/vr-api-client.yaml
       docker exec velociraptor rm -f /tmp/vr-api-client.yaml 2>/dev/null || true
@@ -605,6 +637,34 @@ fi
 
 echo "═══════════════════════════════════════════════════"
 echo "Install complete"
-echo "  Timesketch installed:   ${INSTALL_TS}"
-echo "  OpenRelik installed:    ${INSTALL_OR}"
-echo "  Velociraptor installed: ${INSTALL_VR}"
+
+# Show actual status — requested vs success
+if [ "${INSTALL_TS}" = "true" ]; then
+  if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
+    echo "  Timesketch:   FAILED — check /opt/openrelik-pipeline/logs/ts-config.log"
+  else
+    echo "  Timesketch:   OK"
+  fi
+else
+  echo "  Timesketch:   skipped"
+fi
+
+if [ "${INSTALL_OR}" = "true" ]; then
+  if [ "${OR_CONFIG_FAILED:-}" = "true" ]; then
+    echo "  OpenRelik:    FAILED — check /opt/openrelik-pipeline/logs/or-config.log"
+  else
+    echo "  OpenRelik:    OK"
+  fi
+else
+  echo "  OpenRelik:    skipped"
+fi
+
+if [ "${INSTALL_VR}" = "true" ]; then
+  if [ "${VR_CONFIG_FAILED:-}" = "true" ]; then
+    echo "  Velociraptor: FAILED — check /opt/openrelik-pipeline/logs/vr-config.log"
+  else
+    echo "  Velociraptor: OK"
+  fi
+else
+  echo "  Velociraptor: skipped"
+fi
