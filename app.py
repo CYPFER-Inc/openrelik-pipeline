@@ -710,6 +710,102 @@ def add_plaso_ts_tasks_to_workflow(folder_id, workflow_id, sketch_name, sketch_i
     return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
 
 
+def add_extract_plaso_ts_tasks_to_workflow(folder_id, workflow_id, sketch_name, sketch_id, timeline_name):
+    """
+    Add tasks to an existing workflow: Extract → Plaso → Timesketch.
+    Used when the uploaded file is an archive (zip, tar, etc.) that needs
+    extraction before Plaso processing.
+    """
+    extraction_task_uuid = str(uuid.uuid4()).replace("-", "")
+    plaso_task_uuid = str(uuid.uuid4()).replace("-", "")
+    timesketch_task_uuid = str(uuid.uuid4()).replace("-", "")
+
+    ts_task_config = [
+        {
+            "name": "sketch_name",
+            "label": "Create a new sketch",
+            "description": "Create a new sketch",
+            "type": "text",
+            "required": False,
+            "value": f"{sketch_name}",
+        },
+        {
+            "name": "timeline_name",
+            "label": "Name of the timeline to create",
+            "description": "Timeline name",
+            "type": "text",
+            "required": False,
+            "value": f"{timeline_name}"
+        }
+    ]
+    if sketch_id != "":
+        ts_task_config = [
+            {
+                "name": "sketch_id",
+                "label": "Add to existing sketch",
+                "description": "Add to existing sketch",
+                "type": "text",
+                "required": False,
+                "value": f"{sketch_id}",
+            },
+            {
+                "name": "timeline_name",
+                "label": "Name of the timeline to create",
+                "description": "Timeline name",
+                "type": "text",
+                "required": False,
+                "value": f"{timeline_name}"
+            }
+        ]
+
+    workflow_spec = {
+        "spec_json": json.dumps(
+            {
+                "workflow": {
+                    "type": "chain",
+                    "isRoot": True,
+                    "tasks": [
+                        {
+                            "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                            "queue_name": "openrelik-worker-extraction",
+                            "display_name": "Extract Archives",
+                            "description": "Extract files from archive",
+                            "task_config": [],
+                            "type": "task",
+                            "uuid": f"{extraction_task_uuid}",
+                            "tasks": [
+                                {
+                                    "task_name": "openrelik-worker-plaso.tasks.log2timeline",
+                                    "queue_name": "openrelik-worker-plaso",
+                                    "display_name": "Plaso: Log2Timeline",
+                                    "description": "Super timelining",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{plaso_task_uuid}",
+                                    "tasks": [
+                                        {
+                                            "task_name": "openrelik-worker-timesketch.tasks.upload",
+                                            "queue_name": "openrelik-worker-timesketch",
+                                            "display_name": "Upload to Timesketch",
+                                            "description": "Upload resulting file to Timesketch",
+                                            "task_config": ts_task_config,
+                                            "type": "task",
+                                            "uuid": f"{timesketch_task_uuid}",
+                                            "tasks": [],
+                                        }
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        )
+    }
+
+    return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
+
+
 def add_hayabusa_tasks_to_workflow(folder_id, workflow_id):
     """
     Add tasks to an existing workflow, including a Plaso task and a Timesketch task.
@@ -1180,7 +1276,12 @@ def api_plaso_timesketch():
     rename_folder(workflow_folder_id, f"{filename} Plaso to Timesketch Workflow Folder")
     rename_workflow(folder_id, workflow_id, f"{filename} Plaso to Timesketch Workflow")
 
-    add_plaso_ts_tasks_to_workflow(folder_id, workflow_id, sketch_name, sketch_id, timeline_name)
+    # Auto-detect archives — add extraction step before Plaso
+    archive_extensions = {".zip", ".tar", ".tar.gz", ".tgz", ".gz", ".7z", ".rar"}
+    if extension.lower() in archive_extensions:
+        add_extract_plaso_ts_tasks_to_workflow(folder_id, workflow_id, sketch_name, sketch_id, timeline_name)
+    else:
+        add_plaso_ts_tasks_to_workflow(folder_id, workflow_id, sketch_name, sketch_id, timeline_name)
     run = run_workflow(folder_id, workflow_id)
 
     return jsonify(

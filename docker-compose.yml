@@ -5,7 +5,7 @@ services:
 
     container_name: openrelik-pipeline
 
-    image: ghcr.io/cypfer-inc/openrelik-pipeline:latest
+    image: ${PIPELINE_IMAGE:-ghcr.io/cypfer-inc/openrelik-pipeline:latest}
 
     restart: always
 
