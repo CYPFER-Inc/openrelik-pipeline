@@ -70,11 +70,30 @@ echo "────────────────────────�
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
+VAULT_CONFIG="${SCRIPT_DIR}/azure.cfg"
+
+# Pull config.env from Azure Key Vault if azure.cfg exists and config.env is missing
+if [ -f "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
+  echo "Pulling config.env from Azure Key Vault..."
+  if command -v python3 &>/dev/null; then
+    python3 "${SCRIPT_DIR}/scripts/vault.py" --pull --config "${VAULT_CONFIG}"
+    if [ $? -ne 0 ]; then
+      echo "ERROR: Failed to pull config.env from vault"
+      exit 1
+    fi
+  else
+    echo "ERROR: python3 not found — cannot pull from vault"
+    echo "       Install python3 or place config.env manually"
+    exit 1
+  fi
+elif [ -f "${VAULT_CONFIG}" ] && [ -f "${CONFIG_FILE}" ]; then
+  echo "config.env exists — skipping vault pull (delete config.env to re-pull)"
+fi
 
 if [ ! -f "${CONFIG_FILE}" ]; then
   echo "ERROR: config.env not found at ${CONFIG_FILE}"
-  echo "       Please contact your Admin for the latest"
-  echo "       file and instructions"
+  echo "       Place an azure.cfg file to pull from vault, or"
+  echo "       contact your Admin for the config.env file"
   exit 1
 fi
 
@@ -486,7 +505,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
       -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
       -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
       -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
-      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-120}" \
+      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
       -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
       -v /var/run/docker.sock:/var/run/docker.sock \
       "${TS_CONFIG_IMAGE}" \
@@ -676,3 +695,10 @@ if [ "${INSTALL_VR}" = "true" ]; then
 else
   echo "  Velociraptor: skipped"
 fi
+
+# Clean up sensitive files — remove vault credentials and config.env
+# These should not persist on the VM after install
+rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
+rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
+echo ""
+echo "Cleanup: azure.cfg and config.env removed"
