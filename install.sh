@@ -268,6 +268,38 @@ if [ "${INSTALL_OR}" = "true" ]; then
     echo "OpenRelik settings.toml updated with public URLs"
   fi
 
+  # Vote infrastructure — read case metadata and configure OpenRelik URLs
+  if [ -f /etc/vote-case.env ]; then
+    source /etc/vote-case.env
+    if [ -n "${CASE_ID}" ]; then
+      OR_URL="https://${CASE_ID}-or.dev.cypfer.io"
+      echo "Configuring OpenRelik for case ${CASE_ID}..."
+
+      # Update config.env and .env
+      sed -i "s|OPENRELIK_SERVER_URL=.*|OPENRELIK_SERVER_URL=${OR_URL}|" /opt/openrelik/config.env 2>/dev/null
+      grep -q "^OPENRELIK_SERVER_URL=" /opt/openrelik/config.env 2>/dev/null || \
+        echo "OPENRELIK_SERVER_URL=${OR_URL}" >> /opt/openrelik/config.env
+      sed -i "s|OPENRELIK_SERVER_URL=.*|OPENRELIK_SERVER_URL=${OR_URL}|" /opt/openrelik/.env 2>/dev/null
+      grep -q "^OPENRELIK_SERVER_URL=" /opt/openrelik/.env 2>/dev/null || \
+        echo "OPENRELIK_SERVER_URL=${OR_URL}" >> /opt/openrelik/.env
+
+      # Update settings.toml
+      sed -i "s|api_server_url = .*|api_server_url = \"${OR_URL}\"|" /opt/openrelik/config/settings.toml
+      sed -i "s|ui_server_url = .*|ui_server_url = \"${OR_URL}\"|" /opt/openrelik/config/settings.toml
+      sed -i "s|allowed_origins = .*|allowed_origins = [\"${OR_URL}\"]|" /opt/openrelik/config/settings.toml
+
+      echo "OpenRelik URLs set to ${OR_URL}"
+
+      # Restart to apply
+      cd /opt/openrelik
+      docker compose down
+      docker compose up -d
+      cd /opt/openrelik-pipeline
+
+      echo "OpenRelik restarted with case ${CASE_ID} URLs"
+    fi
+  fi
+
   OPENRELIK_PG_PASSWORD=$(grep POSTGRES_PASSWORD /opt/openrelik/config.env | cut -d= -f2)
   sed -i "s/POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${OPENRELIK_PG_PASSWORD}/" /opt/openrelik-pipeline/config.env
   echo "Postgres password synced from OpenRelik config"
@@ -553,6 +585,18 @@ RUN chmod +x entrypoint && \
 WORKDIR /
 CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
 
+  # Determine VR hostname — use vote case domain if available, otherwise IP
+  VR_HOSTNAME="${IP_ADDRESS}"
+  VR_CLIENT_URL="${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"
+  if [ -f /etc/vote-case.env ]; then
+    source /etc/vote-case.env
+    if [ -n "${CASE_DOMAIN}" ]; then
+      VR_HOSTNAME="${CASE_DOMAIN}"
+      VR_CLIENT_URL="https://${CASE_DOMAIN}:8000/"
+      echo "Vote case detected — VR hostname: ${VR_HOSTNAME}"
+    fi
+  fi
+
   cat << EOF | sudo tee entrypoint > /dev/null
 #!/bin/bash
 
@@ -568,12 +612,12 @@ if [ ! -f server.config.yaml ]; then
   chmod +x /opt/velociraptor
 
   ./velociraptor config generate > server.config.yaml --merge '{
-    "Frontend": {"hostname": "$IP_ADDRESS"},
+    "Frontend": {"hostname": "${VR_HOSTNAME}"},
     "API": {"bind_address": "0.0.0.0"},
     "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
-    "Client": {"server_urls": ["${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"], "use_self_signed_ssl": true},
+    "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
 
