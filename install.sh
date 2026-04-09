@@ -122,10 +122,17 @@ rewrite_compose_images() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
-VAULT_CONFIG="/etc/azure.cfg"
+# Look for azure.cfg — /etc/azure.cfg (vote/prod) or local (dev)
+if [ -f "/etc/azure.cfg" ]; then
+  VAULT_CONFIG="/etc/azure.cfg"
+elif [ -f "${SCRIPT_DIR}/azure.cfg" ]; then
+  VAULT_CONFIG="${SCRIPT_DIR}/azure.cfg"
+else
+  VAULT_CONFIG=""
+fi
 
 # Pull config.env from Azure Key Vault if azure.cfg exists and config.env is missing
-if [ -f "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
+if [ -n "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
   echo "Pulling config.env from Azure Key Vault..."
   if command -v python3 &>/dev/null; then
     python3 "${SCRIPT_DIR}/scripts/vault.py" --pull --config "${VAULT_CONFIG}"
@@ -138,14 +145,15 @@ if [ -f "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
     echo "       Install python3 or place config.env manually"
     exit 1
   fi
-elif [ -f "${VAULT_CONFIG}" ] && [ -f "${CONFIG_FILE}" ]; then
+elif [ -n "${VAULT_CONFIG}" ] && [ -f "${CONFIG_FILE}" ]; then
   echo "config.env exists — skipping vault pull (delete config.env to re-pull)"
 fi
 
 if [ ! -f "${CONFIG_FILE}" ]; then
   echo "ERROR: config.env not found at ${CONFIG_FILE}"
-  echo "       Place azure.cfg at /etc/azure.cfg to pull from vault, or"
-  echo "       contact your Admin for the config.env file"
+  echo "       Options:"
+  echo "         - Place azure.cfg at /etc/azure.cfg (prod) or ${SCRIPT_DIR}/azure.cfg (dev)"
+  echo "         - Or place config.env directly at ${CONFIG_FILE}"
   exit 1
 fi
 
@@ -918,6 +926,7 @@ fi
 # Clean up sensitive files — remove vault credentials and config.env
 # These should not persist on the VM after install
 rm -f /etc/azure.cfg 2>/dev/null
+rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
 rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
 echo ""
 echo "Cleanup: azure.cfg and config.env removed"
