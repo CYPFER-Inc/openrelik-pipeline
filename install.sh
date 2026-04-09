@@ -66,6 +66,21 @@ echo "  OpenRelik:    $INSTALL_OR"
 echo "  Velociraptor: $INSTALL_VR"
 echo "─────────────────────────────────────────────────"
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+retry_pull() {
+  # Retry docker compose pull up to 5 times to handle transient TLS errors
+  # (common in LXC containers with OVN Geneve encapsulation)
+  local max_retries=5
+  for i in $(seq 1 $max_retries); do
+    docker compose pull && return 0
+    echo "Pull failed, retry $i/$max_retries..."
+    sleep 5
+  done
+  echo "ERROR: docker compose pull failed after $max_retries attempts"
+  return 1
+}
+
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -310,6 +325,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
   grep -q '^[[:space:]]*storage_path[[:space:]]*=' "$CONFIG_TOML" || \
     sed -i "/^\[server\]/a $LEGACY_STORAGE_PATH" "$CONFIG_TOML"
 
+  retry_pull
   docker compose up -d
 
   echo "Checking OpenRelik database initialisation..."
@@ -394,7 +410,16 @@ psort.py --version || true
   echo "Running OpenRelik post-install configuration..."
 
   OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
-  if ! docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
+  OR_PULL_OK=false
+  for i in 1 2 3 4 5; do
+    if docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
+      OR_PULL_OK=true
+      break
+    fi
+    echo "or-config pull failed, retry $i/5..."
+    sleep 5
+  done
+  if [ "${OR_PULL_OK}" != "true" ]; then
     echo "ERROR: Failed to pull or-config image — skipping OpenRelik configuration"
     echo "       Check GHCR credentials and image name: ${OR_CONFIG_IMAGE}"
     OR_CONFIG_FAILED=true
@@ -472,7 +497,7 @@ psort.py --version || true
 
   echo "Deploying the OpenRelik pipeline..."
   cd /opt/openrelik-pipeline
-  docker compose pull
+  retry_pull
   docker compose up -d
 
   # Start the Timesketch worker from the OpenRelik compose
@@ -508,7 +533,16 @@ if [ "${INSTALL_TS}" = "true" ]; then
   fi
 
   echo "  Pulling ts-config image: ${TS_CONFIG_IMAGE}"
-  if ! docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
+  TS_PULL_OK=false
+  for i in 1 2 3 4 5; do
+    if docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
+      TS_PULL_OK=true
+      break
+    fi
+    echo "ts-config pull failed, retry $i/5..."
+    sleep 5
+  done
+  if [ "${TS_PULL_OK}" != "true" ]; then
     echo "ERROR: Failed to pull ts-config image — skipping Timesketch configuration"
     echo "       Check GHCR credentials and image name: ${TS_CONFIG_IMAGE}"
     TS_CONFIG_FAILED=true
@@ -627,7 +661,11 @@ fi
 exec /opt/velociraptor --config /opt/server.config.yaml frontend -v
 EOF
 
-  docker compose build 2>&1 | tee /opt/openrelik-pipeline/logs/velociraptor-build.log
+  for i in 1 2 3 4 5; do
+    docker compose build 2>&1 | tee /opt/openrelik-pipeline/logs/velociraptor-build.log && break
+    echo "VR build failed, retry $i/5..."
+    sleep 5
+  done
   docker compose up -d
 
   echo "Configuring Velociraptor via API..."
@@ -668,7 +706,16 @@ EOF
       fi
 
       VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
-      if ! docker pull "${VR_CONFIG_IMAGE}"; then
+      VR_PULL_OK=false
+      for i in 1 2 3 4 5; do
+        if docker pull "${VR_CONFIG_IMAGE}"; then
+          VR_PULL_OK=true
+          break
+        fi
+        echo "vr-config pull failed, retry $i/5..."
+        sleep 5
+      done
+      if [ "${VR_PULL_OK}" != "true" ]; then
         echo "ERROR: Failed to pull vr-config image — skipping Velociraptor configuration"
         echo "       Check GHCR credentials and image name: ${VR_CONFIG_IMAGE}"
         VR_CONFIG_FAILED=true
