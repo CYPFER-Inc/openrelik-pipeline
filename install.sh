@@ -108,8 +108,8 @@ rewrite_compose_images() {
     return
   fi
   echo "Rewriting image references to use local registry: ${REGISTRY_MIRROR}"
-  # Rewrite ghcr.io/ references
-  sed -i "s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
+  # Rewrite ghcr.io/ references — but skip CYPFER images (small, change often, pull direct)
+  sed -i "/cypfer-inc/!s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
   # Rewrite docker.io/ references (explicit)
   sed -i "s|image: docker.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
   # Rewrite bare images (redis:8, postgres:17, etc.) — add library/ prefix
@@ -468,7 +468,6 @@ psort.py --version || true
   echo "Running OpenRelik post-install configuration..."
 
   OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
-  OR_CONFIG_IMAGE=$(mirror_image "${OR_CONFIG_IMAGE}")
   OR_PULL_OK=false
   for i in 1 2 3 4 5; do
     if docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
@@ -581,7 +580,6 @@ if [ "${INSTALL_TS}" = "true" ]; then
   echo "Running Timesketch post-install configuration..."
 
   TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
-  TS_CONFIG_IMAGE=$(mirror_image "${TS_CONFIG_IMAGE}")
   TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
 
   # GHCR login — shared token with vr-config and or-config
@@ -775,7 +773,6 @@ EOF
       fi
 
       VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
-      VR_CONFIG_IMAGE=$(mirror_image "${VR_CONFIG_IMAGE}")
       VR_PULL_OK=false
       for i in 1 2 3 4 5; do
         if docker pull "${VR_CONFIG_IMAGE}"; then
