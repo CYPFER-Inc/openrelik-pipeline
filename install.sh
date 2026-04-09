@@ -228,22 +228,28 @@ if [ "${ENVIRONMENT}" = "prod" ]; then
 fi
 
 if [ "${ENVIRONMENT}" = "prod" ]; then
-  MISSING_PROD_VARS=()
-  for VAR in CASE_NUMBER TIMESKETCH_PUBLIC_URL OPENRELIK_PUBLIC_URL \
-             VELOCIRAPTOR_PUBLIC_URL VELOCIRAPTOR_CLIENT_URL PIPELINE_PUBLIC_URL; do
-    if [ -z "${!VAR}" ]; then
-      MISSING_PROD_VARS+=("${VAR}")
-    fi
-  done
-
-  if [ ${#MISSING_PROD_VARS[@]} -gt 0 ]; then
-    echo "ERROR: Production mode requires these variables to be set in config.env:"
-    for VAR in "${MISSING_PROD_VARS[@]}"; do
-      echo "       - ${VAR}"
+  # When vote-case.env exists, URLs are computed from CASE_ID/CASE_DOMAIN.
+  # Only check for manual prod variables when vote is not managing the deploy.
+  if [ ! -f /etc/vote-case.env ]; then
+    MISSING_PROD_VARS=()
+    for VAR in CASE_NUMBER TIMESKETCH_PUBLIC_URL OPENRELIK_PUBLIC_URL \
+               VELOCIRAPTOR_PUBLIC_URL VELOCIRAPTOR_CLIENT_URL PIPELINE_PUBLIC_URL; do
+      if [ -z "${!VAR}" ]; then
+        MISSING_PROD_VARS+=("${VAR}")
+      fi
     done
-    exit 1
+
+    if [ ${#MISSING_PROD_VARS[@]} -gt 0 ]; then
+      echo "ERROR: Production mode requires these variables to be set in config.env:"
+      for VAR in "${MISSING_PROD_VARS[@]}"; do
+        echo "       - ${VAR}"
+      done
+      exit 1
+    fi
+    echo "Production environment variables verified"
+  else
+    echo "Vote-managed deployment — URLs computed from /etc/vote-case.env"
   fi
-  echo "Production environment variables verified"
 
 elif [ "${ENVIRONMENT}" = "dev" ]; then
   echo "Dev mode — services accessible via direct IP:port"
