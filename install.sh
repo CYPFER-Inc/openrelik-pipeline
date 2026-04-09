@@ -318,6 +318,36 @@ EOF
   # Rewrite Timesketch docker-compose to use local mirror for future restarts
   rewrite_compose_images /opt/timesketch/docker-compose.yml
 
+  # Fix: Timesketch DB race condition (google/timesketch#3263)
+  # Multiple gunicorn workers try to CREATE TABLE simultaneously on first boot,
+  # causing crashes and health check failures. Fix: ensure DB is initialized
+  # before starting the full worker pool.
+  echo "Ensuring Timesketch database is initialized..."
+  docker compose stop timesketch-web 2>/dev/null
+  docker compose run --rm --entrypoint "" timesketch-web \
+    python3 -c "from timesketch.app import create_app; create_app()" \
+    2>/opt/openrelik-pipeline/logs/timesketch-db-init.log || true
+  docker compose up -d timesketch-web
+
+  # Wait for Timesketch to be healthy after DB init
+  echo "Waiting for Timesketch to become healthy..."
+  TS_HEALTHY=false
+  for i in $(seq 1 60); do
+    if docker compose ps timesketch-web 2>/dev/null | grep -q "healthy"; then
+      TS_HEALTHY=true
+      break
+    fi
+    if [ $((i % 10)) -eq 0 ]; then
+      echo "  Still waiting... ($((i * 5))s)"
+    fi
+    sleep 5
+  done
+  if [ "${TS_HEALTHY}" = "true" ]; then
+    echo "Timesketch is healthy"
+  else
+    echo "WARNING: Timesketch may still be starting — continuing install"
+  fi
+
   FORMATTER_FILE="/opt/timesketch/etc/timesketch/plaso_formatters.yaml"
 
   if [ -f "$FORMATTER_FILE" ]; then
