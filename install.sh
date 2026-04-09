@@ -1,19 +1,20 @@
 #!/bin/bash
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
-# bash install.sh              — install everything (default)
-# bash install.sh --all        — install everything
-# bash install.sh --ts         — install Timesketch only
-# bash install.sh --or         — install OpenRelik (requires Timesketch already installed)
-# bash install.sh --vr         — install Velociraptor only
-# bash install.sh --ts --or    — install Timesketch + OpenRelik
-# bash install.sh --or --vr    — install OpenRelik + Velociraptor
+# bash install.sh                          — install everything (default)
+# bash install.sh --all                    — install everything
+# bash install.sh --ts                     — install Timesketch only
+# bash install.sh --or                     — install OpenRelik (requires Timesketch)
+# bash install.sh --vr                     — install Velociraptor only
+# bash install.sh --ts --or               — install Timesketch + OpenRelik
+# bash install.sh --config /path/azure.cfg — pull config.env from vault using this cfg
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Parse arguments ──────────────────────────────────────────────────────────
 INSTALL_TS=false
 INSTALL_OR=false
 INSTALL_VR=false
+AZURE_CFG_ARG=""
 
 if [ $# -eq 0 ]; then
   INSTALL_TS=true
@@ -21,8 +22,8 @@ if [ $# -eq 0 ]; then
   INSTALL_VR=true
 fi
 
-for ARG in "$@"; do
-  case "$ARG" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --all)
       INSTALL_TS=true
       INSTALL_OR=true
@@ -37,27 +38,38 @@ for ARG in "$@"; do
     --vr)
       INSTALL_VR=true
       ;;
+    --config)
+      shift
+      if [ -z "$1" ]; then
+        echo "ERROR: --config requires a path to an azure.cfg file"
+        exit 1
+      fi
+      AZURE_CFG_ARG="$1"
+      ;;
     --help|-h)
-      echo "Usage: bash install.sh [--ts] [--or] [--vr] [--all]"
+      echo "Usage: bash install.sh [--ts] [--or] [--vr] [--all] [--config /path/to/azure.cfg]"
       echo ""
-      echo "  --ts   Install Timesketch and dependencies"
-      echo "  --or   Install OpenRelik and dependencies (requires Timesketch)"
-      echo "  --vr   Install Velociraptor and configure via API"
-      echo "  --all  Install everything (default if no arguments given)"
+      echo "  --ts               Install Timesketch and dependencies"
+      echo "  --or               Install OpenRelik and dependencies (requires Timesketch)"
+      echo "  --vr               Install Velociraptor and configure via API"
+      echo "  --all              Install everything (default if no arguments given)"
+      echo "  --config <path>    Pull config.env from Azure Key Vault using this cfg file"
       echo ""
       echo "Examples:"
-      echo "  bash install.sh              # install all"
-      echo "  bash install.sh --vr         # Velociraptor only"
-      echo "  bash install.sh --ts --or    # Timesketch + OpenRelik"
-      echo "  bash install.sh --or --vr    # OpenRelik + Velociraptor"
+      echo "  bash install.sh                                    # install all"
+      echo "  bash install.sh --vr                               # Velociraptor only"
+      echo "  bash install.sh --ts --or                          # Timesketch + OpenRelik"
+      echo "  bash install.sh --config /path/azure-dev.cfg       # pull config from vault, install all"
+      echo "  bash install.sh --config /path/azure-dev.cfg --ts  # pull config, install TS only"
       exit 0
       ;;
     *)
-      echo "ERROR: Unknown argument: $ARG"
+      echo "ERROR: Unknown argument: $1"
       echo "       Run bash install.sh --help for usage"
       exit 1
       ;;
   esac
+  shift
 done
 
 echo "Install plan:"
@@ -122,8 +134,14 @@ rewrite_compose_images() {
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
-# Look for azure.cfg — /etc/azure.cfg (vote/prod) or local (dev)
-if [ -f "/etc/azure.cfg" ]; then
+# Look for azure.cfg — --config arg, /etc/azure.cfg (vote/prod), or local (dev)
+if [ -n "${AZURE_CFG_ARG}" ]; then
+  if [ ! -f "${AZURE_CFG_ARG}" ]; then
+    echo "ERROR: Config file not found: ${AZURE_CFG_ARG}"
+    exit 1
+  fi
+  VAULT_CONFIG="${AZURE_CFG_ARG}"
+elif [ -f "/etc/azure.cfg" ]; then
   VAULT_CONFIG="/etc/azure.cfg"
 elif [ -f "${SCRIPT_DIR}/azure.cfg" ]; then
   VAULT_CONFIG="${SCRIPT_DIR}/azure.cfg"
