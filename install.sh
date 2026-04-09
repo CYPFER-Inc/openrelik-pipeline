@@ -287,6 +287,25 @@ if [ "${INSTALL_TS}" = "true" ]; then
   echo "Output is being logged, this may take 5-7 minutes"
   curl -s -O https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
   chmod 755 deploy_timesketch.sh
+
+  # Pre-pull Timesketch images from local mirror before the deploy script runs.
+  # deploy_timesketch.sh creates the compose file and does docker compose up internally —
+  # if images are already cached locally, the pull phase succeeds instantly.
+  if [ -n "${REGISTRY_MIRROR:-}" ]; then
+    echo "Pre-pulling Timesketch images from local mirror..."
+    for img in \
+      us-docker.pkg.dev/osdfir-registry/timesketch/timesketch:latest \
+      us-docker.pkg.dev/osdfir-registry/timesketch/timesketch-worker:latest \
+      docker.io/library/postgres:17 \
+      docker.io/library/redis:8 \
+      docker.io/opensearchproject/opensearch:2.18.0; do
+      MIRRORED=$(mirror_image "$img")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null && \
+        docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
+    done
+  fi
+
   (./deploy_timesketch.sh <<EOF
 Y
 N
@@ -295,7 +314,7 @@ EOF
 
   cd timesketch
 
-  # Rewrite Timesketch docker-compose to use local mirror
+  # Rewrite Timesketch docker-compose to use local mirror for future restarts
   rewrite_compose_images /opt/timesketch/docker-compose.yml
 
   FORMATTER_FILE="/opt/timesketch/etc/timesketch/plaso_formatters.yaml"
@@ -329,6 +348,28 @@ if [ "${INSTALL_OR}" = "true" ]; then
   echo "Deploying OpenRelik..."
   cd /opt
   curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
+
+  # Pre-pull OpenRelik images from local mirror before the deploy script runs
+  if [ -n "${REGISTRY_MIRROR:-}" ]; then
+    echo "Pre-pulling OpenRelik images from local mirror..."
+    for img in \
+      ghcr.io/openrelik/openrelik-server:0.7.0 \
+      ghcr.io/openrelik/openrelik-ui:0.7.0 \
+      ghcr.io/openrelik/openrelik-mediator:0.7.0 \
+      ghcr.io/openrelik/openrelik-metrics:0.7.0 \
+      ghcr.io/openrelik/openrelik-worker-plaso:0.5.0 \
+      ghcr.io/openrelik/openrelik-worker-extraction:0.5.0 \
+      ghcr.io/openrelik/openrelik-worker-strings:0.3.0 \
+      ghcr.io/openrelik/openrelik-worker-grep:0.2.0 \
+      docker.io/library/postgres:17 \
+      docker.io/library/redis:8 \
+      prom/prometheus:v3; do
+      MIRRORED=$(mirror_image "$img")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null && \
+        docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
+    done
+  fi
 
   echo "1" | bash install.sh 2>&1 | tee /opt/openrelik-pipeline/logs/openrelik-install.log
 
