@@ -158,7 +158,7 @@ if [ -n "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
     if ! command -v pip3 &>/dev/null; then
       apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null 2>&1
     fi
-    pip3 install --quiet azure-keyvault-secrets azure-identity 2>/dev/null || true
+    pip3 install --quiet --break-system-packages azure-keyvault-secrets azure-identity 2>/dev/null || true
     python3 "${SCRIPT_DIR}/scripts/vault.py" --pull --config "${VAULT_CONFIG}"
     if [ $? -ne 0 ]; then
       echo "ERROR: Failed to pull config.env from vault"
