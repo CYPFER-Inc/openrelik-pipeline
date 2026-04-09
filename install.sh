@@ -81,6 +81,43 @@ retry_pull() {
   return 1
 }
 
+mirror_image() {
+  # Rewrite an image reference to use the local registry mirror if configured.
+  # Usage: mirror_image "ghcr.io/openrelik/openrelik-server:0.7.0"
+  # Returns: "51.222.196.105:5000/openrelik/openrelik-server:0.7.0" (if mirrored)
+  #      or: "ghcr.io/openrelik/openrelik-server:0.7.0" (if no mirror)
+  local image="$1"
+  if [ -n "${REGISTRY_MIRROR:-}" ]; then
+    # Strip the registry prefix (ghcr.io/, docker.io/library/, docker.io/, etc.)
+    local path="${image#*/}"
+    # Handle docker.io/library/ special case (e.g. redis:8 → library/redis:8)
+    if [[ "$image" != */* ]]; then
+      path="library/${image}"
+    fi
+    echo "${REGISTRY_MIRROR}/${path}"
+  else
+    echo "$image"
+  fi
+}
+
+rewrite_compose_images() {
+  # Rewrite all image references in a docker-compose.yml to use the local mirror.
+  # Usage: rewrite_compose_images /opt/openrelik/docker-compose.yml
+  local compose_file="$1"
+  if [ -z "${REGISTRY_MIRROR:-}" ]; then
+    return
+  fi
+  echo "Rewriting image references to use local registry: ${REGISTRY_MIRROR}"
+  # Rewrite ghcr.io/ references
+  sed -i "s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
+  # Rewrite docker.io/ references (explicit)
+  sed -i "s|image: docker.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
+  # Rewrite bare images (redis:8, postgres:17, etc.) — add library/ prefix
+  sed -i -E "s|image: (redis\|postgres\|ubuntu\|prom/prometheus):|image: ${REGISTRY_MIRROR}/library/\1:|g" "$compose_file" 2>/dev/null
+  # Handle prom/prometheus separately (not under library/)
+  sed -i "s|image: ${REGISTRY_MIRROR}/library/prom/|image: ${REGISTRY_MIRROR}/prom/|g" "$compose_file"
+}
+
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -217,6 +254,13 @@ if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   }
 fi
 
+# Local registry mirror — if set, pulls go through vRack instead of internet
+if [ -n "${REGISTRY_MIRROR:-}" ]; then
+  echo "Local registry mirror: ${REGISTRY_MIRROR}"
+  # Login to mirror if it requires auth
+  docker login "${REGISTRY_MIRROR}" 2>/dev/null || true
+fi
+
 cd /opt
 
 # ─── Timesketch ───────────────────────────────────────────────────────────────
@@ -233,6 +277,9 @@ EOF
   ) 2>/opt/openrelik-pipeline/logs/timesketch-install.log
 
   cd timesketch
+
+  # Rewrite Timesketch docker-compose to use local mirror
+  rewrite_compose_images /opt/timesketch/docker-compose.yml
 
   FORMATTER_FILE="/opt/timesketch/etc/timesketch/plaso_formatters.yaml"
 
@@ -272,6 +319,10 @@ if [ "${INSTALL_OR}" = "true" ]; then
   cd /opt/openrelik
   chmod 777 data/prometheus
   docker compose down
+
+  # Rewrite OpenRelik docker-compose to use local mirror
+  rewrite_compose_images /opt/openrelik/docker-compose.yml
+
   sed -i 's/127\.0\.0\.1/0\.0\.0\.0/g' /opt/openrelik/docker-compose.yml
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config.env
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config/settings.toml
@@ -417,6 +468,7 @@ psort.py --version || true
   echo "Running OpenRelik post-install configuration..."
 
   OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
+  OR_CONFIG_IMAGE=$(mirror_image "${OR_CONFIG_IMAGE}")
   OR_PULL_OK=false
   for i in 1 2 3 4 5; do
     if docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
@@ -504,6 +556,7 @@ psort.py --version || true
 
   echo "Deploying the OpenRelik pipeline..."
   cd /opt/openrelik-pipeline
+  rewrite_compose_images /opt/openrelik-pipeline/docker-compose.yml
   retry_pull
   docker compose up -d
 
@@ -528,6 +581,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
   echo "Running Timesketch post-install configuration..."
 
   TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
+  TS_CONFIG_IMAGE=$(mirror_image "${TS_CONFIG_IMAGE}")
   TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
 
   # GHCR login — shared token with vr-config and or-config
@@ -625,7 +679,8 @@ if [ "${INSTALL_VR}" = "true" ]; then
       - "8001:8001"
       - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
 
-  echo "FROM ubuntu:22.04
+  VR_BASE_IMAGE=$(mirror_image "ubuntu:22.04")
+  echo "FROM ${VR_BASE_IMAGE}
 COPY ./entrypoint .
 RUN chmod +x entrypoint && \
     apt update && \
@@ -720,6 +775,7 @@ EOF
       fi
 
       VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
+      VR_CONFIG_IMAGE=$(mirror_image "${VR_CONFIG_IMAGE}")
       VR_PULL_OK=false
       for i in 1 2 3 4 5; do
         if docker pull "${VR_CONFIG_IMAGE}"; then
