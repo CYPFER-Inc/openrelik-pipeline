@@ -154,11 +154,15 @@ fi
 if [ -n "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
   echo "Pulling config.env from Azure Key Vault..."
   if command -v python3 &>/dev/null; then
-    # Ensure pip and Azure SDK are installed
-    if ! command -v pip3 &>/dev/null; then
-      apt-get update -qq && apt-get install -y -qq python3-pip >/dev/null 2>&1
+    # Ensure Azure SDK is installed — try apt first, fall back to pip
+    if ! python3 -c "import azure.keyvault.secrets" 2>/dev/null; then
+      echo "  Installing Azure SDK..."
+      apt-get update -qq && apt-get install -y -qq python3-azure-keyvault-secrets python3-azure-identity >/dev/null 2>&1 || {
+        # Not in apt repos — fall back to pip
+        command -v pip3 &>/dev/null || apt-get install -y -qq python3-pip >/dev/null 2>&1
+        pip3 install --quiet --break-system-packages azure-keyvault-secrets azure-identity 2>/dev/null || true
+      }
     fi
-    pip3 install --quiet --break-system-packages azure-keyvault-secrets azure-identity 2>/dev/null || true
     python3 "${SCRIPT_DIR}/scripts/vault.py" --pull --config "${VAULT_CONFIG}"
     if [ $? -ne 0 ]; then
       echo "ERROR: Failed to pull config.env from vault"
