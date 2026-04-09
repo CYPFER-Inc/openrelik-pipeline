@@ -16,12 +16,6 @@ INSTALL_OR=false
 INSTALL_VR=false
 AZURE_CFG_ARG=""
 
-if [ $# -eq 0 ]; then
-  INSTALL_TS=true
-  INSTALL_OR=true
-  INSTALL_VR=true
-fi
-
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)
@@ -71,6 +65,13 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Default to install everything if no component was selected
+if [ "${INSTALL_TS}" = "false" ] && [ "${INSTALL_OR}" = "false" ] && [ "${INSTALL_VR}" = "false" ]; then
+  INSTALL_TS=true
+  INSTALL_OR=true
+  INSTALL_VR=true
+fi
 
 echo "Install plan:"
 echo "  Timesketch:   $INSTALL_TS"
