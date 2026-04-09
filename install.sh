@@ -90,12 +90,10 @@ mirror_image() {
   if [ -n "${REGISTRY_MIRROR:-}" ]; then
     # Strip the registry prefix (ghcr.io/, docker.io/library/, docker.io/, etc.)
     local path="${image#*/}"
-    # Handle bare images (e.g. redis:8, ubuntu:22.04) — no slash in the name
+    # Handle bare images (e.g. redis:8, ubuntu:22.04) — add library/ prefix
     if [[ "$image" != */* ]]; then
-      path="${image}"
+      path="library/${image}"
     fi
-    # Strip docker.io/library/ prefix if present
-    path="${path#library/}"
     echo "${REGISTRY_MIRROR}/${path}"
   else
     echo "$image"
@@ -114,9 +112,9 @@ rewrite_compose_images() {
   sed -i "/cypfer-inc/!s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
   # Rewrite docker.io/ references (explicit)
   sed -i "s|image: docker.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
-  # Rewrite bare images (redis:8, postgres:17, etc.) — no library/ prefix
-  sed -i -E "s|image: (redis\|postgres\|ubuntu):|image: ${REGISTRY_MIRROR}/\1:|g" "$compose_file" 2>/dev/null
-  # Rewrite prom/prometheus
+  # Rewrite bare images (redis:8, postgres:17, etc.) — add library/ prefix
+  sed -i -E "s|image: (redis\|postgres\|ubuntu):|image: ${REGISTRY_MIRROR}/library/\1:|g" "$compose_file" 2>/dev/null
+  # Rewrite prom/prometheus (not under library/)
   sed -i "s|image: prom/|image: ${REGISTRY_MIRROR}/prom/|g" "$compose_file"
 }
 
@@ -300,6 +298,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
       us-docker.pkg.dev/osdfir-registry/timesketch/timesketch-worker:latest \
       postgres:17 \
       redis:8 \
+      ubuntu:22.04 \
       docker.io/opensearchproject/opensearch:2.18.0; do
       MIRRORED=$(mirror_image "$img")
       echo "  Pulling ${MIRRORED}..."
@@ -365,6 +364,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
       ghcr.io/openrelik/openrelik-worker-grep:0.2.0 \
       postgres:17 \
       redis:8 \
+      ubuntu:22.04 \
       prom/prometheus:v3; do
       MIRRORED=$(mirror_image "$img")
       echo "  Pulling ${MIRRORED}..."
