@@ -311,7 +311,10 @@ fi
 if [ -n "${REGISTRY_MIRROR:-}" ]; then
   echo "Local registry mirror: ${REGISTRY_MIRROR}"
   # Login to mirror if it requires auth
-  docker login "${REGISTRY_MIRROR}" 2>/dev/null || true
+  # Test mirror connectivity (no auth needed for local registry)
+  docker pull "${REGISTRY_MIRROR}/library/redis:8" >/dev/null 2>&1 && \
+    echo "  Mirror is accessible" || \
+    echo "  WARNING: Mirror not accessible — will fall back to internet pulls"
 fi
 
 cd /opt
