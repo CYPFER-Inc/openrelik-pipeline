@@ -406,6 +406,13 @@ psort.py --version || true
     echo "WARNING: GHCR_USER or GHCR_TOKEN not set in config.env — skipping GHCR login"
   fi
 
+  # Verify OpenRelik is running before attempting configuration
+  if ! docker network inspect openrelik_default &>/dev/null; then
+    echo "ERROR: openrelik_default network not found — OpenRelik failed to deploy"
+    echo "       Skipping or-config, check logs above for pull/startup errors"
+    OR_CONFIG_FAILED=true
+  fi
+
   # Run OpenRelik post-install configuration (workers, workflows, folders)
   echo "Running OpenRelik post-install configuration..."
 
@@ -557,8 +564,15 @@ if [ "${INSTALL_TS}" = "true" ]; then
     TS_NETWORK="timesketch_default"
   fi
 
+  # Verify the target network exists before running ts-config
+  if ! docker network inspect "${TS_NETWORK}" &>/dev/null; then
+    echo "ERROR: ${TS_NETWORK} network not found — Timesketch or OpenRelik failed to deploy"
+    echo "       Skipping ts-config"
+    TS_CONFIG_FAILED=true
+  fi
+
   if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
-    echo "  Skipping ts-config run — image pull failed"
+    echo "  Skipping ts-config run — image pull failed or network missing"
   else
     echo "  Starting ts-config (network: ${TS_NETWORK})..."
     docker run --rm \
