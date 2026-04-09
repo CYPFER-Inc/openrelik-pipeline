@@ -216,6 +216,17 @@ mkdir -p /opt/openrelik-pipeline/logs
 ENVIRONMENT=${ENVIRONMENT:-dev}
 echo "Environment: ${ENVIRONMENT}"
 
+# In prod, capture all output (stdout + stderr) to a master log file.
+# No terminal to watch in prod — logs are the only record.
+# In dev, output goes to console as normal; per-container stderr still
+# goes to individual log files.
+if [ "${ENVIRONMENT}" = "prod" ]; then
+  mkdir -p /opt/openrelik-pipeline/logs
+  MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
+  echo "Prod mode — all output logged to ${MASTER_LOG}"
+  exec > >(tee -a "${MASTER_LOG}") 2>&1
+fi
+
 if [ "${ENVIRONMENT}" = "prod" ]; then
   MISSING_PROD_VARS=()
   for VAR in CASE_NUMBER TIMESKETCH_PUBLIC_URL OPENRELIK_PUBLIC_URL \
