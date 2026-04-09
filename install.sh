@@ -70,7 +70,7 @@ echo "────────────────────────�
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
-VAULT_CONFIG="${SCRIPT_DIR}/azure.cfg"
+VAULT_CONFIG="/etc/azure.cfg"
 
 # Pull config.env from Azure Key Vault if azure.cfg exists and config.env is missing
 if [ -f "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
@@ -92,7 +92,7 @@ fi
 
 if [ ! -f "${CONFIG_FILE}" ]; then
   echo "ERROR: config.env not found at ${CONFIG_FILE}"
-  echo "       Place an azure.cfg file to pull from vault, or"
+  echo "       Place azure.cfg at /etc/azure.cfg to pull from vault, or"
   echo "       contact your Admin for the config.env file"
   exit 1
 fi
@@ -698,8 +698,7 @@ fi
 
 # Clean up sensitive files — remove vault credentials and config.env
 # These should not persist on the VM after install
-rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
-rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
 rm -f /etc/azure.cfg 2>/dev/null
+rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
 echo ""
 echo "Cleanup: azure.cfg and config.env removed"
