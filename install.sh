@@ -700,5 +700,6 @@ fi
 # These should not persist on the VM after install
 rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
 rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
+rm -f /etc/azure.cfg 2>/dev/null
 echo ""
 echo "Cleanup: azure.cfg and config.env removed"
