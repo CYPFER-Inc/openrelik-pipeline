@@ -773,7 +773,7 @@ if [ "${INSTALL_VR}" = "true" ]; then
       - VELOCIRAPTOR_PASSWORD=${VELOCIRAPTOR_PASSWORD}
       - IP_ADDRESS=${IP_ADDRESS}
     ports:
-      - "8000:8000"
+      - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
       - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
 
@@ -786,15 +786,23 @@ RUN chmod +x entrypoint && \
 WORKDIR /
 CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
 
-  # Determine VR hostname — use vote case domain if available, otherwise IP
+  # Determine VR hostname and client comms port
+  # Vote: clients connect to {CASE_ID}-vr.client.dev.cypfer.io:8443 (grey cloud, SNI passthrough)
+  # Dev:  clients connect to {IP_ADDRESS}:8000 (direct)
   VR_HOSTNAME="${IP_ADDRESS}"
+  VR_CLIENT_PORT="8000"
   VR_CLIENT_URL="${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"
   if [ -f /etc/vote-case.env ]; then
     source /etc/vote-case.env
-    if [ -n "${CASE_DOMAIN}" ]; then
-      VR_HOSTNAME="${CASE_DOMAIN}"
-      VR_CLIENT_URL="https://${CASE_DOMAIN}:8000/"
-      echo "Vote case detected — VR hostname: ${VR_HOSTNAME}"
+    if [ -n "${CASE_ID}" ]; then
+      VR_CLIENT_DOMAIN="${CASE_ID}-vr.client.dev.cypfer.io"
+      VR_HOSTNAME="${VR_CLIENT_DOMAIN}"
+      VR_CLIENT_PORT="8443"
+      VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
+      VELOCIRAPTOR_PUBLIC_URL="https://${CASE_DOMAIN}"
+      echo "Vote case detected:"
+      echo "  VR GUI:    ${CASE_DOMAIN} (Cloudflare → nginx → :8889)"
+      echo "  VR Client: ${VR_CLIENT_DOMAIN}:8443 (grey cloud → nginx SNI → :8443)"
     fi
   fi
 
@@ -813,7 +821,7 @@ if [ ! -f server.config.yaml ]; then
   chmod +x /opt/velociraptor
 
   ./velociraptor config generate > server.config.yaml --merge '{
-    "Frontend": {"hostname": "${VR_HOSTNAME}"},
+    "Frontend": {"hostname": "${VR_HOSTNAME}", "bind_address": "0.0.0.0", "bind_port": ${VR_CLIENT_PORT}},
     "API": {"bind_address": "0.0.0.0"},
     "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"},
     "Monitoring": {"bind_address": "0.0.0.0"},
