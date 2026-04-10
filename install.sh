@@ -795,7 +795,7 @@ CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
   if [ -f /etc/vote-case.env ]; then
     source /etc/vote-case.env
     if [ -n "${CASE_ID}" ]; then
-      VR_CLIENT_DOMAIN="${CASE_ID}-vr.client.dev.cypfer.io"
+      VR_CLIENT_DOMAIN="${CASE_CLIENT_DOMAIN:-${CASE_ID}-vr.client.dev.cypfer.io}"
       VR_HOSTNAME="${VR_CLIENT_DOMAIN}"
       VR_CLIENT_PORT="8443"
       VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
