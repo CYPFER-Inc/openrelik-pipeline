@@ -758,6 +758,27 @@ fi
 if [ "${INSTALL_VR}" = "true" ]; then
   echo "═══════════════════════════════════════════════════"
   echo "Deploying Velociraptor..."
+
+  # Determine VR hostname and client comms port before generating docker-compose
+  # Vote: clients connect to {CASE_ID}-vr.client.dev.cypfer.io:8443 (grey cloud, SNI passthrough)
+  # Dev:  clients connect to {IP_ADDRESS}:8000 (direct)
+  VR_HOSTNAME="${IP_ADDRESS}"
+  VR_CLIENT_PORT="8000"
+  VR_CLIENT_URL="${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"
+  if [ -f /etc/vote-case.env ]; then
+    source /etc/vote-case.env
+    if [ -n "${CASE_ID}" ]; then
+      VR_CLIENT_DOMAIN="${CASE_CLIENT_DOMAIN:-${CASE_ID}-vr.client.dev.cypfer.io}"
+      VR_HOSTNAME="${VR_CLIENT_DOMAIN}"
+      VR_CLIENT_PORT="8443"
+      VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
+      VELOCIRAPTOR_PUBLIC_URL="https://${CASE_DOMAIN}"
+      echo "Vote case detected:"
+      echo "  VR GUI:    ${CASE_DOMAIN} (Cloudflare → nginx → :8889)"
+      echo "  VR Client: ${VR_CLIENT_DOMAIN}:8443 (grey cloud → nginx SNI → :8443)"
+    fi
+  fi
+
   mkdir -p /opt/velociraptor
   cd /opt/velociraptor
   echo """services:
@@ -785,26 +806,6 @@ RUN chmod +x entrypoint && \
     apt install -y curl wget jq
 WORKDIR /
 CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
-
-  # Determine VR hostname and client comms port
-  # Vote: clients connect to {CASE_ID}-vr.client.dev.cypfer.io:8443 (grey cloud, SNI passthrough)
-  # Dev:  clients connect to {IP_ADDRESS}:8000 (direct)
-  VR_HOSTNAME="${IP_ADDRESS}"
-  VR_CLIENT_PORT="8000"
-  VR_CLIENT_URL="${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"
-  if [ -f /etc/vote-case.env ]; then
-    source /etc/vote-case.env
-    if [ -n "${CASE_ID}" ]; then
-      VR_CLIENT_DOMAIN="${CASE_CLIENT_DOMAIN:-${CASE_ID}-vr.client.dev.cypfer.io}"
-      VR_HOSTNAME="${VR_CLIENT_DOMAIN}"
-      VR_CLIENT_PORT="8443"
-      VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
-      VELOCIRAPTOR_PUBLIC_URL="https://${CASE_DOMAIN}"
-      echo "Vote case detected:"
-      echo "  VR GUI:    ${CASE_DOMAIN} (Cloudflare → nginx → :8889)"
-      echo "  VR Client: ${VR_CLIENT_DOMAIN}:8443 (grey cloud → nginx SNI → :8443)"
-    fi
-  fi
 
   cat << EOF | sudo tee entrypoint > /dev/null
 #!/bin/bash
