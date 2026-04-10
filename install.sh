@@ -674,86 +674,6 @@ psort.py --version || true
   echo "OpenRelik deployment complete"
 fi
 
-# ─── Timesketch post-install configuration ────────────────────────────────────
-if [ "${INSTALL_TS}" = "true" ]; then
-  echo "═══════════════════════════════════════════════════"
-  echo "Running Timesketch post-install configuration..."
-
-  TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
-  TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
-
-  # GHCR login — shared token with vr-config and or-config
-  if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
-    echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
-      && echo "GHCR login successful" \
-      || echo "WARNING: GHCR login failed — ts-config image pull may fail"
-  else
-    echo "WARNING: GHCR_USER or GHCR_TOKEN not set — skipping GHCR login"
-  fi
-
-  echo "  Pulling ts-config image: ${TS_CONFIG_IMAGE}"
-  TS_PULL_OK=false
-  for i in 1 2 3 4 5; do
-    if docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
-      TS_PULL_OK=true
-      break
-    fi
-    echo "ts-config pull failed, retry $i/5..."
-    sleep 5
-  done
-  if [ "${TS_PULL_OK}" != "true" ]; then
-    echo "ERROR: Failed to pull ts-config image — skipping Timesketch configuration"
-    echo "       Check GHCR credentials and image name: ${TS_CONFIG_IMAGE}"
-    TS_CONFIG_FAILED=true
-  fi
-
-  # Determine the correct Timesketch network
-  # When OR is also installed timesketch-web has been connected to openrelik_default.
-  # When TS is installed standalone the native timesketch_default network is used.
-  if [ "${INSTALL_OR}" = "true" ]; then
-    TS_NETWORK="openrelik_default"
-  else
-    TS_NETWORK="timesketch_default"
-  fi
-
-  # Verify the target network exists before running ts-config
-  if ! docker network inspect "${TS_NETWORK}" &>/dev/null; then
-    echo "ERROR: ${TS_NETWORK} network not found — Timesketch or OpenRelik failed to deploy"
-    echo "       Skipping ts-config"
-    TS_CONFIG_FAILED=true
-  fi
-
-  if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
-    echo "  Skipping ts-config run — image pull failed or network missing"
-  else
-    echo "  Starting ts-config (network: ${TS_NETWORK})..."
-    docker run --rm \
-      --name timesketch-configure \
-      --network "${TS_NETWORK}" \
-      -e TS_URL="http://timesketch-web:5000" \
-      -e TS_USERNAME="admin" \
-      -e TS_PASSWORD="${TIMESKETCH_PASSWORD}" \
-      -e TS_CONTAINER="timesketch-web" \
-      -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
-      -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
-      -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
-      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
-      -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
-      -v /var/run/docker.sock:/var/run/docker.sock \
-      "${TS_CONFIG_IMAGE}" \
-      2>/opt/openrelik-pipeline/logs/ts-config.log
-
-    TS_CONFIG_EXIT=$?
-    if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
-      echo "Timesketch configuration complete"
-    else
-      echo "ERROR: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
-      echo "       /opt/openrelik-pipeline/logs/ts-config.log"
-      TS_CONFIG_FAILED=true
-    fi
-  fi
-fi
-
 # ─── Velociraptor ─────────────────────────────────────────────────────────────
 if [ "${INSTALL_VR}" = "true" ]; then
   echo "═══════════════════════════════════════════════════"
@@ -927,6 +847,86 @@ EOF
   fi
 
   echo "Velociraptor deployment complete"
+fi
+
+# ─── Timesketch post-install configuration ────────────────────────────────────
+# Runs last — gives Timesketch maximum time to start (OpenSearch is slow on LXC).
+# By this point TS has had the full OR + VR deploy time to become healthy.
+if [ "${INSTALL_TS}" = "true" ]; then
+  echo "═══════════════════════════════════════════════════"
+  echo "Running Timesketch post-install configuration..."
+
+  TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
+  TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
+
+  # GHCR login — shared token with vr-config and or-config
+  if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
+    echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
+      && echo "GHCR login successful" \
+      || echo "WARNING: GHCR login failed — ts-config image pull may fail"
+  else
+    echo "WARNING: GHCR_USER or GHCR_TOKEN not set — skipping GHCR login"
+  fi
+
+  echo "  Pulling ts-config image: ${TS_CONFIG_IMAGE}"
+  TS_PULL_OK=false
+  for i in 1 2 3 4 5; do
+    if docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
+      TS_PULL_OK=true
+      break
+    fi
+    echo "ts-config pull failed, retry $i/5..."
+    sleep 5
+  done
+  if [ "${TS_PULL_OK}" != "true" ]; then
+    echo "ERROR: Failed to pull ts-config image — skipping Timesketch configuration"
+    echo "       Check GHCR credentials and image name: ${TS_CONFIG_IMAGE}"
+    TS_CONFIG_FAILED=true
+  fi
+
+  # Determine the correct Timesketch network
+  if [ "${INSTALL_OR}" = "true" ]; then
+    TS_NETWORK="openrelik_default"
+  else
+    TS_NETWORK="timesketch_default"
+  fi
+
+  # Verify the target network exists before running ts-config
+  if ! docker network inspect "${TS_NETWORK}" &>/dev/null; then
+    echo "ERROR: ${TS_NETWORK} network not found — Timesketch or OpenRelik failed to deploy"
+    echo "       Skipping ts-config"
+    TS_CONFIG_FAILED=true
+  fi
+
+  if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
+    echo "  Skipping ts-config run — image pull failed or network missing"
+  else
+    echo "  Starting ts-config (network: ${TS_NETWORK})..."
+    docker run --rm \
+      --name timesketch-configure \
+      --network "${TS_NETWORK}" \
+      -e TS_URL="http://timesketch-web:5000" \
+      -e TS_USERNAME="admin" \
+      -e TS_PASSWORD="${TIMESKETCH_PASSWORD}" \
+      -e TS_CONTAINER="timesketch-web" \
+      -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
+      -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
+      -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
+      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
+      -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      "${TS_CONFIG_IMAGE}" \
+      2>/opt/openrelik-pipeline/logs/ts-config.log
+
+    TS_CONFIG_EXIT=$?
+    if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
+      echo "Timesketch configuration complete"
+    else
+      echo "ERROR: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
+      echo "       /opt/openrelik-pipeline/logs/ts-config.log"
+      TS_CONFIG_FAILED=true
+    fi
+  fi
 fi
 
 echo "═══════════════════════════════════════════════════"
