@@ -859,6 +859,14 @@ if [ "${INSTALL_TS}" = "true" ]; then
   TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
   TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
 
+  # Determine sketch name — vote uses case ID, dev uses "CYPFER Dev"
+  if [ -f /etc/vote-case.env ]; then
+    source /etc/vote-case.env
+    TS_SKETCH_NAME="CYPFER Case-${CASE_ID}"
+  else
+    TS_SKETCH_NAME="${TS_SKETCH_NAME:-CYPFER Dev}"
+  fi
+
   # GHCR login — shared token with vr-config and or-config
   if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
     echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null \
@@ -910,6 +918,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
       -e TS_PASSWORD="${TIMESKETCH_PASSWORD}" \
       -e TS_CONTAINER="timesketch-web" \
       -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
+      -e TS_SKETCH_NAME="${TS_SKETCH_NAME}" \
       -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
       -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
       -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
