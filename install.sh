@@ -300,6 +300,15 @@ else
 fi
 echo "─────────────────────────────────────────────────"
 
+# Log which images/branches will be used
+echo "Component images:"
+echo "  Pipeline:   ${PIPELINE_IMAGE:-ghcr.io/cypfer-inc/openrelik-pipeline:latest}"
+echo "  OR Config:  ${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
+echo "  TS Config:  ${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
+echo "  VR Config:  ${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}"
+echo "  install.sh: $(git -C "${SCRIPT_DIR}" branch --show-current 2>/dev/null || echo 'unknown')"
+echo "─────────────────────────────────────────────────"
+
 if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   echo "Authenticating to Docker Hub..."
   echo "${DOCKERHUB_TOKEN}" | docker login -u "${DOCKERHUB_USER}" --password-stdin || {
