@@ -1,28 +1,23 @@
 #!/bin/bash
 
 # ─── Usage ────────────────────────────────────────────────────────────────────
-# bash install.sh              — install everything (default)
-# bash install.sh --all        — install everything
-# bash install.sh --ts         — install Timesketch only
-# bash install.sh --or         — install OpenRelik (requires Timesketch already installed)
-# bash install.sh --vr         — install Velociraptor only
-# bash install.sh --ts --or    — install Timesketch + OpenRelik
-# bash install.sh --or --vr    — install OpenRelik + Velociraptor
+# bash install.sh                          — install everything (default)
+# bash install.sh --all                    — install everything
+# bash install.sh --ts                     — install Timesketch only
+# bash install.sh --or                     — install OpenRelik (requires Timesketch)
+# bash install.sh --vr                     — install Velociraptor only
+# bash install.sh --ts --or               — install Timesketch + OpenRelik
+# bash install.sh --config /path/azure.cfg — pull config.env from vault using this cfg
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ─── Parse arguments ──────────────────────────────────────────────────────────
 INSTALL_TS=false
 INSTALL_OR=false
 INSTALL_VR=false
+AZURE_CFG_ARG=""
 
-if [ $# -eq 0 ]; then
-  INSTALL_TS=true
-  INSTALL_OR=true
-  INSTALL_VR=true
-fi
-
-for ARG in "$@"; do
-  case "$ARG" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --all)
       INSTALL_TS=true
       INSTALL_OR=true
@@ -37,28 +32,46 @@ for ARG in "$@"; do
     --vr)
       INSTALL_VR=true
       ;;
+    --config)
+      shift
+      if [ -z "$1" ]; then
+        echo "ERROR: --config requires a path to an azure.cfg file"
+        exit 1
+      fi
+      AZURE_CFG_ARG="$1"
+      ;;
     --help|-h)
-      echo "Usage: bash install.sh [--ts] [--or] [--vr] [--all]"
+      echo "Usage: bash install.sh [--ts] [--or] [--vr] [--all] [--config /path/to/azure.cfg]"
       echo ""
-      echo "  --ts   Install Timesketch and dependencies"
-      echo "  --or   Install OpenRelik and dependencies (requires Timesketch)"
-      echo "  --vr   Install Velociraptor and configure via API"
-      echo "  --all  Install everything (default if no arguments given)"
+      echo "  --ts               Install Timesketch and dependencies"
+      echo "  --or               Install OpenRelik and dependencies (requires Timesketch)"
+      echo "  --vr               Install Velociraptor and configure via API"
+      echo "  --all              Install everything (default if no arguments given)"
+      echo "  --config <path>    Pull config.env from Azure Key Vault using this cfg file"
       echo ""
       echo "Examples:"
-      echo "  bash install.sh              # install all"
-      echo "  bash install.sh --vr         # Velociraptor only"
-      echo "  bash install.sh --ts --or    # Timesketch + OpenRelik"
-      echo "  bash install.sh --or --vr    # OpenRelik + Velociraptor"
+      echo "  bash install.sh                                    # install all"
+      echo "  bash install.sh --vr                               # Velociraptor only"
+      echo "  bash install.sh --ts --or                          # Timesketch + OpenRelik"
+      echo "  bash install.sh --config /path/azure-dev.cfg       # pull config from vault, install all"
+      echo "  bash install.sh --config /path/azure-dev.cfg --ts  # pull config, install TS only"
       exit 0
       ;;
     *)
-      echo "ERROR: Unknown argument: $ARG"
+      echo "ERROR: Unknown argument: $1"
       echo "       Run bash install.sh --help for usage"
       exit 1
       ;;
   esac
+  shift
 done
+
+# Default to install everything if no component was selected
+if [ "${INSTALL_TS}" = "false" ] && [ "${INSTALL_OR}" = "false" ] && [ "${INSTALL_VR}" = "false" ]; then
+  INSTALL_TS=true
+  INSTALL_OR=true
+  INSTALL_VR=true
+fi
 
 echo "Install plan:"
 echo "  Timesketch:   $INSTALL_TS"
@@ -66,15 +79,109 @@ echo "  OpenRelik:    $INSTALL_OR"
 echo "  Velociraptor: $INSTALL_VR"
 echo "─────────────────────────────────────────────────"
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+retry_pull() {
+  # Retry docker compose pull up to 5 times to handle transient TLS errors
+  # (common in LXC containers with OVN Geneve encapsulation)
+  local max_retries=5
+  for i in $(seq 1 $max_retries); do
+    docker compose pull && return 0
+    echo "Pull failed, retry $i/$max_retries..."
+    sleep 5
+  done
+  echo "ERROR: docker compose pull failed after $max_retries attempts"
+  return 1
+}
+
+mirror_image() {
+  # Rewrite an image reference to use the local registry mirror if configured.
+  # Usage: mirror_image "ghcr.io/openrelik/openrelik-server:0.7.0"
+  # Returns: "51.222.196.105:5000/openrelik/openrelik-server:0.7.0" (if mirrored)
+  #      or: "ghcr.io/openrelik/openrelik-server:0.7.0" (if no mirror)
+  local image="$1"
+  if [ -n "${REGISTRY_MIRROR:-}" ]; then
+    # Strip the registry prefix (ghcr.io/, docker.io/library/, docker.io/, etc.)
+    local path="${image#*/}"
+    # Handle bare images (e.g. redis:8, ubuntu:22.04) — add library/ prefix
+    if [[ "$image" != */* ]]; then
+      path="library/${image}"
+    fi
+    echo "${REGISTRY_MIRROR}/${path}"
+  else
+    echo "$image"
+  fi
+}
+
+rewrite_compose_images() {
+  # Rewrite all image references in a docker-compose.yml to use the local mirror.
+  # Usage: rewrite_compose_images /opt/openrelik/docker-compose.yml
+  local compose_file="$1"
+  if [ -z "${REGISTRY_MIRROR:-}" ]; then
+    return
+  fi
+  echo "Rewriting image references to use local registry: ${REGISTRY_MIRROR}"
+  # Rewrite ghcr.io/ references — but skip CYPFER images (small, change often, pull direct)
+  sed -i "/cypfer-inc/!s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
+  # Rewrite docker.io/ references (explicit)
+  sed -i "s|image: docker.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
+  # Rewrite bare images (redis:8, postgres:17, etc.) — add library/ prefix
+  sed -i -E "s|image: (redis\|postgres\|ubuntu):|image: ${REGISTRY_MIRROR}/library/\1:|g" "$compose_file" 2>/dev/null
+  # Rewrite prom/prometheus (not under library/)
+  sed -i "s|image: prom/|image: ${REGISTRY_MIRROR}/prom/|g" "$compose_file"
+}
+
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${SCRIPT_DIR}/config.env"
+# Look for azure.cfg — --config arg, /etc/azure.cfg (vote/prod), or local (dev)
+if [ -n "${AZURE_CFG_ARG}" ]; then
+  if [ ! -f "${AZURE_CFG_ARG}" ]; then
+    echo "ERROR: Config file not found: ${AZURE_CFG_ARG}"
+    exit 1
+  fi
+  VAULT_CONFIG="${AZURE_CFG_ARG}"
+elif [ -f "/etc/azure.cfg" ]; then
+  VAULT_CONFIG="/etc/azure.cfg"
+elif [ -f "${SCRIPT_DIR}/azure.cfg" ]; then
+  VAULT_CONFIG="${SCRIPT_DIR}/azure.cfg"
+else
+  VAULT_CONFIG=""
+fi
+
+# Pull config.env from Azure Key Vault if azure.cfg exists and config.env is missing
+if [ -n "${VAULT_CONFIG}" ] && [ ! -f "${CONFIG_FILE}" ]; then
+  echo "Pulling config.env from Azure Key Vault..."
+  if command -v python3 &>/dev/null; then
+    # Ensure Azure SDK is installed — try apt first, fall back to pip
+    if ! python3 -c "import azure.keyvault.secrets" 2>/dev/null; then
+      echo "  Installing Azure SDK..."
+      apt-get update -qq && apt-get install -y -qq python3-azure-keyvault-secrets python3-azure-identity >/dev/null 2>&1 || {
+        # Not in apt repos — fall back to pip
+        command -v pip3 &>/dev/null || apt-get install -y -qq python3-pip >/dev/null 2>&1
+        pip3 install --quiet --break-system-packages azure-keyvault-secrets azure-identity 2>/dev/null || true
+      }
+    fi
+    python3 "${SCRIPT_DIR}/scripts/vault.py" --pull --config "${VAULT_CONFIG}"
+    if [ $? -ne 0 ]; then
+      echo "ERROR: Failed to pull config.env from vault"
+      exit 1
+    fi
+  else
+    echo "ERROR: python3 not found — cannot pull from vault"
+    echo "       Install python3 or place config.env manually"
+    exit 1
+  fi
+elif [ -n "${VAULT_CONFIG}" ] && [ -f "${CONFIG_FILE}" ]; then
+  echo "config.env exists — skipping vault pull (delete config.env to re-pull)"
+fi
 
 if [ ! -f "${CONFIG_FILE}" ]; then
   echo "ERROR: config.env not found at ${CONFIG_FILE}"
-  echo "       Please contact your Admin for the latest"
-  echo "       file and instructions"
+  echo "       Options:"
+  echo "         - Place azure.cfg at /etc/azure.cfg (prod) or ${SCRIPT_DIR}/azure.cfg (dev)"
+  echo "         - Or place config.env directly at ${CONFIG_FILE}"
   exit 1
 fi
 
@@ -145,23 +252,40 @@ mkdir -p /opt/openrelik-pipeline/logs
 ENVIRONMENT=${ENVIRONMENT:-dev}
 echo "Environment: ${ENVIRONMENT}"
 
+# In prod, capture all output (stdout + stderr) to a master log file.
+# No terminal to watch in prod — logs are the only record.
+# In dev, output goes to console as normal; per-container stderr still
+# goes to individual log files.
 if [ "${ENVIRONMENT}" = "prod" ]; then
-  MISSING_PROD_VARS=()
-  for VAR in CASE_NUMBER TIMESKETCH_PUBLIC_URL OPENRELIK_PUBLIC_URL \
-             VELOCIRAPTOR_PUBLIC_URL VELOCIRAPTOR_CLIENT_URL PIPELINE_PUBLIC_URL; do
-    if [ -z "${!VAR}" ]; then
-      MISSING_PROD_VARS+=("${VAR}")
-    fi
-  done
+  mkdir -p /opt/openrelik-pipeline/logs
+  MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
+  echo "Prod mode — all output logged to ${MASTER_LOG}"
+  exec > >(tee -a "${MASTER_LOG}") 2>&1
+fi
 
-  if [ ${#MISSING_PROD_VARS[@]} -gt 0 ]; then
-    echo "ERROR: Production mode requires these variables to be set in config.env:"
-    for VAR in "${MISSING_PROD_VARS[@]}"; do
-      echo "       - ${VAR}"
+if [ "${ENVIRONMENT}" = "prod" ]; then
+  # When vote-case.env exists, URLs are computed from CASE_ID/CASE_DOMAIN.
+  # Only check for manual prod variables when vote is not managing the deploy.
+  if [ ! -f /etc/vote-case.env ]; then
+    MISSING_PROD_VARS=()
+    for VAR in CASE_NUMBER TIMESKETCH_PUBLIC_URL OPENRELIK_PUBLIC_URL \
+               VELOCIRAPTOR_PUBLIC_URL VELOCIRAPTOR_CLIENT_URL PIPELINE_PUBLIC_URL; do
+      if [ -z "${!VAR}" ]; then
+        MISSING_PROD_VARS+=("${VAR}")
+      fi
     done
-    exit 1
+
+    if [ ${#MISSING_PROD_VARS[@]} -gt 0 ]; then
+      echo "ERROR: Production mode requires these variables to be set in config.env:"
+      for VAR in "${MISSING_PROD_VARS[@]}"; do
+        echo "       - ${VAR}"
+      done
+      exit 1
+    fi
+    echo "Production environment variables verified"
+  else
+    echo "Vote-managed deployment — URLs computed from /etc/vote-case.env"
   fi
-  echo "Production environment variables verified"
 
 elif [ "${ENVIRONMENT}" = "dev" ]; then
   echo "Dev mode — services accessible via direct IP:port"
@@ -183,6 +307,16 @@ if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   }
 fi
 
+# Local registry mirror — if set, pulls go through vRack instead of internet
+if [ -n "${REGISTRY_MIRROR:-}" ]; then
+  echo "Local registry mirror: ${REGISTRY_MIRROR}"
+  # Login to mirror if it requires auth
+  # Test mirror connectivity (no auth needed for local registry)
+  docker pull "${REGISTRY_MIRROR}/library/redis:8" >/dev/null 2>&1 && \
+    echo "  Mirror is accessible" || \
+    echo "  WARNING: Mirror not accessible — will fall back to internet pulls"
+fi
+
 cd /opt
 
 # ─── Timesketch ───────────────────────────────────────────────────────────────
@@ -192,6 +326,26 @@ if [ "${INSTALL_TS}" = "true" ]; then
   echo "Output is being logged, this may take 5-7 minutes"
   curl -s -O https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
   chmod 755 deploy_timesketch.sh
+
+  # Pre-pull Timesketch images from local mirror before the deploy script runs.
+  # deploy_timesketch.sh creates the compose file and does docker compose up internally —
+  # if images are already cached locally, the pull phase succeeds instantly.
+  if [ -n "${REGISTRY_MIRROR:-}" ]; then
+    echo "Pre-pulling Timesketch images from local mirror..."
+    for img in \
+      us-docker.pkg.dev/osdfir-registry/timesketch/timesketch:latest \
+      us-docker.pkg.dev/osdfir-registry/timesketch/timesketch-worker:latest \
+      postgres:17 \
+      redis:8 \
+      ubuntu:22.04 \
+      docker.io/opensearchproject/opensearch:2.18.0; do
+      MIRRORED=$(mirror_image "$img")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null && \
+        docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
+    done
+  fi
+
   (./deploy_timesketch.sh <<EOF
 Y
 N
@@ -199,6 +353,10 @@ EOF
   ) 2>/opt/openrelik-pipeline/logs/timesketch-install.log
 
   cd timesketch
+
+  # Rewrite Timesketch docker-compose to use local mirror for future restarts
+  rewrite_compose_images /opt/timesketch/docker-compose.yml
+
 
   FORMATTER_FILE="/opt/timesketch/etc/timesketch/plaso_formatters.yaml"
 
@@ -232,12 +390,39 @@ if [ "${INSTALL_OR}" = "true" ]; then
   cd /opt
   curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
 
+  # Pre-pull OpenRelik images from local mirror before the deploy script runs
+  if [ -n "${REGISTRY_MIRROR:-}" ]; then
+    echo "Pre-pulling OpenRelik images from local mirror..."
+    for img in \
+      ghcr.io/openrelik/openrelik-server:0.7.0 \
+      ghcr.io/openrelik/openrelik-ui:0.7.0 \
+      ghcr.io/openrelik/openrelik-mediator:0.7.0 \
+      ghcr.io/openrelik/openrelik-metrics:0.7.0 \
+      ghcr.io/openrelik/openrelik-worker-plaso:0.5.0 \
+      ghcr.io/openrelik/openrelik-worker-extraction:0.5.0 \
+      ghcr.io/openrelik/openrelik-worker-strings:0.3.0 \
+      ghcr.io/openrelik/openrelik-worker-grep:0.2.0 \
+      postgres:17 \
+      redis:8 \
+      ubuntu:22.04 \
+      prom/prometheus:v3; do
+      MIRRORED=$(mirror_image "$img")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null && \
+        docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
+    done
+  fi
+
   echo "1" | bash install.sh 2>&1 | tee /opt/openrelik-pipeline/logs/openrelik-install.log
 
   echo "Configuring OpenRelik..."
   cd /opt/openrelik
   chmod 777 data/prometheus
   docker compose down
+
+  # Rewrite OpenRelik docker-compose to use local mirror
+  rewrite_compose_images /opt/openrelik/docker-compose.yml
+
   sed -i 's/127\.0\.0\.1/0\.0\.0\.0/g' /opt/openrelik/docker-compose.yml
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config.env
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config/settings.toml
@@ -247,6 +432,38 @@ if [ "${INSTALL_OR}" = "true" ]; then
     sed -i "s|ui_server_url = \"http://$IP_ADDRESS:8711\"|ui_server_url = \"${OPENRELIK_PUBLIC_URL}\"|" /opt/openrelik/config/settings.toml
     sed -i "s|allowed_origins = \[.*\]|allowed_origins = [\"http://$IP_ADDRESS:8711\", \"${OPENRELIK_PUBLIC_URL}\"]|" /opt/openrelik/config/settings.toml
     echo "OpenRelik settings.toml updated with public URLs"
+  fi
+
+  # Vote infrastructure — read case metadata and configure OpenRelik URLs
+  if [ -f /etc/vote-case.env ]; then
+    source /etc/vote-case.env
+    if [ -n "${CASE_ID}" ]; then
+      OR_URL="https://${CASE_ID}-or.dev.cypfer.io"
+      echo "Configuring OpenRelik for case ${CASE_ID}..."
+
+      # Update config.env and .env
+      sed -i "s|OPENRELIK_SERVER_URL=.*|OPENRELIK_SERVER_URL=${OR_URL}|" /opt/openrelik/config.env 2>/dev/null
+      grep -q "^OPENRELIK_SERVER_URL=" /opt/openrelik/config.env 2>/dev/null || \
+        echo "OPENRELIK_SERVER_URL=${OR_URL}" >> /opt/openrelik/config.env
+      sed -i "s|OPENRELIK_SERVER_URL=.*|OPENRELIK_SERVER_URL=${OR_URL}|" /opt/openrelik/.env 2>/dev/null
+      grep -q "^OPENRELIK_SERVER_URL=" /opt/openrelik/.env 2>/dev/null || \
+        echo "OPENRELIK_SERVER_URL=${OR_URL}" >> /opt/openrelik/.env
+
+      # Update settings.toml
+      sed -i "s|api_server_url = .*|api_server_url = \"${OR_URL}\"|" /opt/openrelik/config/settings.toml
+      sed -i "s|ui_server_url = .*|ui_server_url = \"${OR_URL}\"|" /opt/openrelik/config/settings.toml
+      sed -i "s|allowed_origins = .*|allowed_origins = [\"${OR_URL}\"]|" /opt/openrelik/config/settings.toml
+
+      echo "OpenRelik URLs set to ${OR_URL}"
+
+      # Restart to apply
+      cd /opt/openrelik
+      docker compose down
+      docker compose up -d
+      cd /opt/openrelik-pipeline
+
+      echo "OpenRelik restarted with case ${CASE_ID} URLs"
+    fi
   fi
 
   OPENRELIK_PG_PASSWORD=$(grep POSTGRES_PASSWORD /opt/openrelik/config.env | cut -d= -f2)
@@ -259,6 +476,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
   grep -q '^[[:space:]]*storage_path[[:space:]]*=' "$CONFIG_TOML" || \
     sed -i "/^\[server\]/a $LEGACY_STORAGE_PATH" "$CONFIG_TOML"
 
+  retry_pull
   docker compose up -d
 
   echo "Checking OpenRelik database initialisation..."
@@ -339,11 +557,27 @@ psort.py --version || true
     echo "WARNING: GHCR_USER or GHCR_TOKEN not set in config.env — skipping GHCR login"
   fi
 
+  # Verify OpenRelik is running before attempting configuration
+  if ! docker network inspect openrelik_default &>/dev/null; then
+    echo "ERROR: openrelik_default network not found — OpenRelik failed to deploy"
+    echo "       Skipping or-config, check logs above for pull/startup errors"
+    OR_CONFIG_FAILED=true
+  fi
+
   # Run OpenRelik post-install configuration (workers, workflows, folders)
   echo "Running OpenRelik post-install configuration..."
 
   OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
-  if ! docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
+  OR_PULL_OK=false
+  for i in 1 2 3 4 5; do
+    if docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
+      OR_PULL_OK=true
+      break
+    fi
+    echo "or-config pull failed, retry $i/5..."
+    sleep 5
+  done
+  if [ "${OR_PULL_OK}" != "true" ]; then
     echo "ERROR: Failed to pull or-config image — skipping OpenRelik configuration"
     echo "       Check GHCR credentials and image name: ${OR_CONFIG_IMAGE}"
     OR_CONFIG_FAILED=true
@@ -421,7 +655,8 @@ psort.py --version || true
 
   echo "Deploying the OpenRelik pipeline..."
   cd /opt/openrelik-pipeline
-  docker compose pull
+  rewrite_compose_images /opt/openrelik-pipeline/docker-compose.yml
+  retry_pull
   docker compose up -d
 
   # Start the Timesketch worker from the OpenRelik compose
@@ -457,7 +692,16 @@ if [ "${INSTALL_TS}" = "true" ]; then
   fi
 
   echo "  Pulling ts-config image: ${TS_CONFIG_IMAGE}"
-  if ! docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
+  TS_PULL_OK=false
+  for i in 1 2 3 4 5; do
+    if docker pull "${TS_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/ts-config-pull.log; then
+      TS_PULL_OK=true
+      break
+    fi
+    echo "ts-config pull failed, retry $i/5..."
+    sleep 5
+  done
+  if [ "${TS_PULL_OK}" != "true" ]; then
     echo "ERROR: Failed to pull ts-config image — skipping Timesketch configuration"
     echo "       Check GHCR credentials and image name: ${TS_CONFIG_IMAGE}"
     TS_CONFIG_FAILED=true
@@ -472,8 +716,15 @@ if [ "${INSTALL_TS}" = "true" ]; then
     TS_NETWORK="timesketch_default"
   fi
 
+  # Verify the target network exists before running ts-config
+  if ! docker network inspect "${TS_NETWORK}" &>/dev/null; then
+    echo "ERROR: ${TS_NETWORK} network not found — Timesketch or OpenRelik failed to deploy"
+    echo "       Skipping ts-config"
+    TS_CONFIG_FAILED=true
+  fi
+
   if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
-    echo "  Skipping ts-config run — image pull failed"
+    echo "  Skipping ts-config run — image pull failed or network missing"
   else
     echo "  Starting ts-config (network: ${TS_NETWORK})..."
     docker run --rm \
@@ -486,7 +737,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
       -e TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH}" \
       -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
       -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
-      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-120}" \
+      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
       -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
       -v /var/run/docker.sock:/var/run/docker.sock \
       "${TS_CONFIG_IMAGE}" \
@@ -522,17 +773,38 @@ if [ "${INSTALL_VR}" = "true" ]; then
       - VELOCIRAPTOR_PASSWORD=${VELOCIRAPTOR_PASSWORD}
       - IP_ADDRESS=${IP_ADDRESS}
     ports:
-      - "8000:8000"
+      - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
       - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
 
-  echo "FROM ubuntu:22.04
+  VR_BASE_IMAGE=$(mirror_image "ubuntu:22.04")
+  echo "FROM ${VR_BASE_IMAGE}
 COPY ./entrypoint .
 RUN chmod +x entrypoint && \
     apt update && \
     apt install -y curl wget jq
 WORKDIR /
 CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
+
+  # Determine VR hostname and client comms port
+  # Vote: clients connect to {CASE_ID}-vr.client.dev.cypfer.io:8443 (grey cloud, SNI passthrough)
+  # Dev:  clients connect to {IP_ADDRESS}:8000 (direct)
+  VR_HOSTNAME="${IP_ADDRESS}"
+  VR_CLIENT_PORT="8000"
+  VR_CLIENT_URL="${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"
+  if [ -f /etc/vote-case.env ]; then
+    source /etc/vote-case.env
+    if [ -n "${CASE_ID}" ]; then
+      VR_CLIENT_DOMAIN="${CASE_ID}-vr.client.dev.cypfer.io"
+      VR_HOSTNAME="${VR_CLIENT_DOMAIN}"
+      VR_CLIENT_PORT="8443"
+      VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
+      VELOCIRAPTOR_PUBLIC_URL="https://${CASE_DOMAIN}"
+      echo "Vote case detected:"
+      echo "  VR GUI:    ${CASE_DOMAIN} (Cloudflare → nginx → :8889)"
+      echo "  VR Client: ${VR_CLIENT_DOMAIN}:8443 (grey cloud → nginx SNI → :8443)"
+    fi
+  fi
 
   cat << EOF | sudo tee entrypoint > /dev/null
 #!/bin/bash
@@ -549,12 +821,12 @@ if [ ! -f server.config.yaml ]; then
   chmod +x /opt/velociraptor
 
   ./velociraptor config generate > server.config.yaml --merge '{
-    "Frontend": {"hostname": "$IP_ADDRESS"},
+    "Frontend": {"hostname": "${VR_HOSTNAME}", "bind_address": "0.0.0.0", "bind_port": ${VR_CLIENT_PORT}},
     "API": {"bind_address": "0.0.0.0"},
     "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
-    "Client": {"server_urls": ["${VELOCIRAPTOR_CLIENT_URL:-https://$IP_ADDRESS:8000/}"], "use_self_signed_ssl": true},
+    "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
 
@@ -564,7 +836,11 @@ fi
 exec /opt/velociraptor --config /opt/server.config.yaml frontend -v
 EOF
 
-  docker compose build 2>&1 | tee /opt/openrelik-pipeline/logs/velociraptor-build.log
+  for i in 1 2 3 4 5; do
+    docker compose build 2>&1 | tee /opt/openrelik-pipeline/logs/velociraptor-build.log && break
+    echo "VR build failed, retry $i/5..."
+    sleep 5
+  done
   docker compose up -d
 
   echo "Configuring Velociraptor via API..."
@@ -605,7 +881,16 @@ EOF
       fi
 
       VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
-      if ! docker pull "${VR_CONFIG_IMAGE}"; then
+      VR_PULL_OK=false
+      for i in 1 2 3 4 5; do
+        if docker pull "${VR_CONFIG_IMAGE}"; then
+          VR_PULL_OK=true
+          break
+        fi
+        echo "vr-config pull failed, retry $i/5..."
+        sleep 5
+      done
+      if [ "${VR_PULL_OK}" != "true" ]; then
         echo "ERROR: Failed to pull vr-config image — skipping Velociraptor configuration"
         echo "       Check GHCR credentials and image name: ${VR_CONFIG_IMAGE}"
         VR_CONFIG_FAILED=true
@@ -676,3 +961,12 @@ if [ "${INSTALL_VR}" = "true" ]; then
 else
   echo "  Velociraptor: skipped"
 fi
+
+# Clean up sensitive files — remove vault credentials and config.env
+# These should not persist on the VM after install
+rm -f /etc/azure.cfg 2>/dev/null
+rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
+[ -n "${AZURE_CFG_ARG}" ] && rm -f "${AZURE_CFG_ARG}" 2>/dev/null
+rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
+echo ""
+echo "Cleanup: azure.cfg and config.env removed"

@@ -1,0 +1,6 @@
+[vault]
+AZURE_TENANT_ID=your-tenant-id-here
+AZURE_CLIENT_ID=your-client-id-here
+AZURE_CLIENT_SECRET=your-client-secret-here
+VAULT_URL=https://refinery-secrets-vault.vault.azure.net/
+SECRET_NAME=automation-dev-config
