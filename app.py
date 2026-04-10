@@ -1163,21 +1163,11 @@ def api_hayabusa_timesketch():
     file.save(file_path)
     fqdn, label = extract_fqdn_and_label(filename)
 
-    # If a label is part of the filename, check to see if sketch exists with the same name and add it to it instead of creating a new sketch
-    sketch_id = ""
-    if fqdn and label and label != "Null":
-        sketch_name = label
-        timeline_name = fqdn
-    else:
-        sketch_name = filename
-
-    try:
-        sketches = ts_client.list_sketches()
-        for sketch in sketches:
-            if sketch.name == sketch_name:
-                sketch_id = sketch.id
-    except Exception as e:
-        print("Error communicating with timesketch API: %s" % (e))
+    # Always send to sketch 1 (created by ts-config on install)
+    # All timelines go into one sketch per deployment
+    sketch_id = 1
+    timeline_name = fqdn if fqdn else timeline_name
+    sketch_name = ""  # not used when sketch_id is set
 
     folder_id = create_folder(f"{filename} Hayabusa Timelines")
     file_id = upload_file(file_path, folder_id)
@@ -1250,21 +1240,11 @@ def api_plaso_timesketch():
     timeline_name, extension = os.path.splitext(filename)
     fqdn, label = extract_fqdn_and_label(filename)
 
-    # If a label is part of the filename, check to see if sketch exists with the same name and add it to it instead of creating a new sketch
-    sketch_id = ""
-    if fqdn and label and label != "Null":
-        sketch_name = label
-        timeline_name = fqdn
-    else:
-        sketch_name = filename
-
-    try:
-        sketches = ts_client.list_sketches()
-        for sketch in sketches:
-            if sketch.name == sketch_name:
-                sketch_id = sketch.id
-    except Exception as e:
-        print("Error communicating with timesketch API: %s" % (e))
+    # Always send to sketch 1 (created by ts-config on install)
+    # All timelines go into one sketch per deployment
+    sketch_id = 1
+    timeline_name = fqdn if fqdn else timeline_name
+    sketch_name = ""  # not used when sketch_id is set
 
     file_path = os.path.join("/tmp", filename)
     file.save(file_path)
