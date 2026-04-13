@@ -312,7 +312,13 @@ if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   }
 fi
 
-# Local registry mirror — if set, pulls go through vRack instead of internet
+# Local registry mirror — only used in prod (LXC/MicroCloud over vRack).
+# Dev VMs pull from the internet directly — ignore mirror setting.
+if [ "${ENVIRONMENT}" = "dev" ] && [ -n "${REGISTRY_MIRROR:-}" ]; then
+  echo "Dev mode — ignoring REGISTRY_MIRROR (not needed on dev VMs)"
+  REGISTRY_MIRROR=""
+fi
+
 if [ -n "${REGISTRY_MIRROR:-}" ]; then
   echo "Local registry mirror: ${REGISTRY_MIRROR}"
   # Login to mirror if it requires auth
