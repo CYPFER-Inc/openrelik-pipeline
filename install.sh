@@ -406,7 +406,7 @@ EOF
     sed -i "s|^GOOGLE_OIDC_ENABLED = False|GOOGLE_OIDC_ENABLED = True|" "$TS_CONF"
     sed -i "s|^GOOGLE_OIDC_CLIENT_ID = .*|GOOGLE_OIDC_CLIENT_ID = '${AUTHENTIK_TS_CLIENT_ID}'|" "$TS_CONF"
     sed -i "s|^GOOGLE_OIDC_CLIENT_SECRET = .*|GOOGLE_OIDC_CLIENT_SECRET = '${AUTHENTIK_TS_CLIENT_SECRET}'|" "$TS_CONF"
-    sed -i "s|^GOOGLE_OIDC_DISCOVERY_URL = .*|GOOGLE_OIDC_DISCOVERY_URL = '${AUTHENTIK_BASE_URL}/application/o/timesketch/.well-known/openid-configuration'|" "$TS_CONF"
+    sed -i "s|^GOOGLE_OIDC_DISCOVERY_URL = .*|GOOGLE_OIDC_DISCOVERY_URL = '${AUTHENTIK_BASE_URL}/application/o/time-sketch/.well-known/openid-configuration'|" "$TS_CONF"
 
     # Auth URL — Authentik's authorize endpoint
     sed -i "s|^GOOGLE_OIDC_AUTH_URL = .*|GOOGLE_OIDC_AUTH_URL = '${AUTHENTIK_BASE_URL}/application/o/authorize/'|" "$TS_CONF"
