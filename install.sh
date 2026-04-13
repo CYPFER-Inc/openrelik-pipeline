@@ -252,16 +252,12 @@ mkdir -p /opt/openrelik-pipeline/logs
 ENVIRONMENT=${ENVIRONMENT:-dev}
 echo "Environment: ${ENVIRONMENT}"
 
-# In prod, capture all output (stdout + stderr) to a master log file.
-# No terminal to watch in prod — logs are the only record.
-# In dev, output goes to console as normal; per-container stderr still
-# goes to individual log files.
-if [ "${ENVIRONMENT}" = "prod" ]; then
-  mkdir -p /opt/openrelik-pipeline/logs
-  MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
-  echo "Prod mode — all output logged to ${MASTER_LOG}"
-  exec > >(tee -a "${MASTER_LOG}") 2>&1
-fi
+# Always capture install output to a log file — on LXC there's no terminal
+# to scroll back through. tee sends to both console and log.
+mkdir -p /opt/openrelik-pipeline/logs
+MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Install starting — environment: ${ENVIRONMENT}" > "${MASTER_LOG}"
+exec > >(tee -a "${MASTER_LOG}") 2>&1
 
 if [ "${ENVIRONMENT}" = "prod" ]; then
   # When vote-case.env exists, URLs are computed from CASE_ID/CASE_DOMAIN.
@@ -981,11 +977,17 @@ else
   echo "  Velociraptor: skipped"
 fi
 
-# Clean up sensitive files — remove vault credentials and config.env
-# These should not persist on the VM after install
+# Clean up sensitive files — always remove vault credentials
 rm -f /etc/azure.cfg 2>/dev/null
 rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
 [ -n "${AZURE_CFG_ARG}" ] && rm -f "${AZURE_CFG_ARG}" 2>/dev/null
-rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
-echo ""
-echo "Cleanup: azure.cfg and config.env removed"
+
+# Only delete config.env if no components failed — keeps it for re-run on failure
+if [ "${TS_CONFIG_FAILED:-}" != "true" ] && [ "${OR_CONFIG_FAILED:-}" != "true" ] && [ "${VR_CONFIG_FAILED:-}" != "true" ]; then
+  rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
+  echo ""
+  echo "Cleanup: azure.cfg and config.env removed"
+else
+  echo ""
+  echo "Cleanup: azure.cfg removed. config.env kept for re-run (some components failed)"
+fi
