@@ -388,6 +388,45 @@ EOF
   echo -e "${TIMESKETCH_PASSWORD}\n${TIMESKETCH_PASSWORD}" | \
     docker compose exec -T timesketch-web tsctl create-user "admin"
 
+  # ─── Timesketch OIDC (prod only) ────────────────────────────────────────────
+  # When AUTHENTIK_TS_CLIENT_ID is set, configure Timesketch to use Authentik
+  # as its OIDC provider. Dev deployments use local auth only.
+  if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_TS_CLIENT_ID:-}" ]; then
+    TS_CONF="/opt/timesketch/etc/timesketch/timesketch.conf"
+
+    # Compute the Authentik discovery URL
+    AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
+
+    echo "Configuring Timesketch OIDC..."
+    echo "  Authentik: ${AUTHENTIK_BASE_URL}"
+    echo "  Client ID: ${AUTHENTIK_TS_CLIENT_ID}"
+
+    # Patch GOOGLE_OIDC_* variables in timesketch.conf
+    # These variable names are Google-prefixed but work with any OIDC provider.
+    sed -i "s|^GOOGLE_OIDC_ENABLED = False|GOOGLE_OIDC_ENABLED = True|" "$TS_CONF"
+    sed -i "s|^GOOGLE_OIDC_CLIENT_ID = .*|GOOGLE_OIDC_CLIENT_ID = '${AUTHENTIK_TS_CLIENT_ID}'|" "$TS_CONF"
+    sed -i "s|^GOOGLE_OIDC_CLIENT_SECRET = .*|GOOGLE_OIDC_CLIENT_SECRET = '${AUTHENTIK_TS_CLIENT_SECRET}'|" "$TS_CONF"
+    sed -i "s|^GOOGLE_OIDC_DISCOVERY_URL = .*|GOOGLE_OIDC_DISCOVERY_URL = '${AUTHENTIK_BASE_URL}/application/o/timesketch/.well-known/openid-configuration'|" "$TS_CONF"
+
+    # Auth URL — Authentik's authorize endpoint
+    sed -i "s|^GOOGLE_OIDC_AUTH_URL = .*|GOOGLE_OIDC_AUTH_URL = '${AUTHENTIK_BASE_URL}/application/o/authorize/'|" "$TS_CONF"
+
+    # Algorithm — Authentik uses RS256 by default
+    sed -i "s|^GOOGLE_OIDC_ALGORITHM = .*|GOOGLE_OIDC_ALGORITHM = 'RS256'|" "$TS_CONF"
+
+    # Hosted domain — not applicable for Authentik, clear it
+    sed -i "s|^GOOGLE_OIDC_HOSTED_DOMAIN = .*|GOOGLE_OIDC_HOSTED_DOMAIN = ''|" "$TS_CONF"
+
+    # Restart Timesketch to pick up OIDC config
+    cd /opt/timesketch
+    docker compose restart timesketch-web
+    cd /opt
+
+    echo "Timesketch OIDC configured"
+  elif [ "${ENVIRONMENT}" = "prod" ]; then
+    echo "AUTHENTIK_TS_CLIENT_ID not set — Timesketch using local auth only"
+  fi
+
   echo "Timesketch deployment complete"
   cd /opt
 fi
@@ -932,6 +971,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
       -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
       -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
       -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
+      -e AUTHENTIK_TS_CLIENT_ID="${AUTHENTIK_TS_CLIENT_ID:-}" \
       -v /var/run/docker.sock:/var/run/docker.sock \
       "${TS_CONFIG_IMAGE}" \
       2>/opt/openrelik-pipeline/logs/ts-config.log
