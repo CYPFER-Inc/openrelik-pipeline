@@ -759,6 +759,19 @@ if [ "${INSTALL_VR}" = "true" ]; then
     fi
   fi
 
+  # Build VR authenticator JSON for --merge. Prod + AUTHENTIK_VR_CLIENT_ID set
+  # means we use OIDC against Authentik. Dev uses local auth (Basic, default).
+  # oidc_name is "authentik" — this becomes part of the callback URL:
+  #   https://{CASE}-vr.dev.cypfer.io/auth/oidc/authentik/callback
+  VR_GUI_EXTRA=""
+  if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_VR_CLIENT_ID:-}" ]; then
+    AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
+    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\"}"
+    echo "Velociraptor OIDC enabled (Authentik)"
+  elif [ "${ENVIRONMENT}" = "prod" ]; then
+    echo "AUTHENTIK_VR_CLIENT_ID not set — Velociraptor using local auth only"
+  fi
+
   mkdir -p /opt/velociraptor
   cd /opt/velociraptor
   echo """services:
@@ -804,7 +817,7 @@ if [ ! -f server.config.yaml ]; then
   ./velociraptor config generate > server.config.yaml --merge '{
     "Frontend": {"hostname": "${VR_HOSTNAME}", "bind_address": "0.0.0.0", "bind_port": ${VR_CLIENT_PORT}},
     "API": {"bind_address": "0.0.0.0"},
-    "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"},
+    "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"${VR_GUI_EXTRA}},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
     "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
@@ -882,6 +895,7 @@ EOF
       else
         docker run --rm \
           --network host \
+          -e AUTHENTIK_VR_CLIENT_ID="${AUTHENTIK_VR_CLIENT_ID:-}" \
           -v /tmp/vr-api-client.yaml:/tmp/api.yaml:ro \
           "${VR_CONFIG_IMAGE}" \
           --api_config /tmp/api.yaml 2>/opt/openrelik-pipeline/logs/vr-config.log
