@@ -252,16 +252,12 @@ mkdir -p /opt/openrelik-pipeline/logs
 ENVIRONMENT=${ENVIRONMENT:-dev}
 echo "Environment: ${ENVIRONMENT}"
 
-# In prod, capture all output (stdout + stderr) to a master log file.
-# No terminal to watch in prod — logs are the only record.
-# In dev, output goes to console as normal; per-container stderr still
-# goes to individual log files.
-if [ "${ENVIRONMENT}" = "prod" ]; then
-  mkdir -p /opt/openrelik-pipeline/logs
-  MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
-  echo "Prod mode — all output logged to ${MASTER_LOG}"
-  exec > >(tee -a "${MASTER_LOG}") 2>&1
-fi
+# Always capture install output to a log file — on LXC there's no terminal
+# to scroll back through. tee sends to both console and log.
+mkdir -p /opt/openrelik-pipeline/logs
+MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Install starting — environment: ${ENVIRONMENT}" > "${MASTER_LOG}"
+exec > >(tee -a "${MASTER_LOG}") 2>&1
 
 if [ "${ENVIRONMENT}" = "prod" ]; then
   # When vote-case.env exists, URLs are computed from CASE_ID/CASE_DOMAIN.
@@ -316,7 +312,13 @@ if [ -n "${DOCKERHUB_USER}" ] && [ -n "${DOCKERHUB_TOKEN}" ]; then
   }
 fi
 
-# Local registry mirror — if set, pulls go through vRack instead of internet
+# Local registry mirror — only used in prod (LXC/MicroCloud over vRack).
+# Dev VMs pull from the internet directly — ignore mirror setting.
+if [ "${ENVIRONMENT}" = "dev" ] && [ -n "${REGISTRY_MIRROR:-}" ]; then
+  echo "Dev mode — ignoring REGISTRY_MIRROR (not needed on dev VMs)"
+  REGISTRY_MIRROR=""
+fi
+
 if [ -n "${REGISTRY_MIRROR:-}" ]; then
   echo "Local registry mirror: ${REGISTRY_MIRROR}"
   # Login to mirror if it requires auth
@@ -336,24 +338,12 @@ if [ "${INSTALL_TS}" = "true" ]; then
   curl -s -O https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
   chmod 755 deploy_timesketch.sh
 
-  # Pre-pull Timesketch images from local mirror before the deploy script runs.
-  # deploy_timesketch.sh creates the compose file and does docker compose up internally —
-  # if images are already cached locally, the pull phase succeeds instantly.
-  if [ -n "${REGISTRY_MIRROR:-}" ]; then
-    echo "Pre-pulling Timesketch images from local mirror..."
-    for img in \
-      us-docker.pkg.dev/osdfir-registry/timesketch/timesketch:latest \
-      us-docker.pkg.dev/osdfir-registry/timesketch/timesketch-worker:latest \
-      postgres:17 \
-      redis:8 \
-      ubuntu:22.04 \
-      docker.io/opensearchproject/opensearch:2.18.0; do
-      MIRRORED=$(mirror_image "$img")
-      echo "  Pulling ${MIRRORED}..."
-      docker pull "${MIRRORED}" 2>/dev/null && \
-        docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
-    done
-  fi
+  # Patch deploy_timesketch.sh to skip 'docker compose up' — we'll do it ourselves
+  # after pre-pulling from the mirror using the correct version tags from .env
+  sed -i 's|docker compose up -d|echo "Skipping docker compose up — will run after pre-pull"|' deploy_timesketch.sh
+  sed -i 's|docker-compose up -d|echo "Skipping docker-compose up — will run after pre-pull"|' deploy_timesketch.sh
+
+  # Pre-pull happens after deploy_timesketch.sh creates .env with version tags.
 
   (./deploy_timesketch.sh <<EOF
 Y
@@ -363,8 +353,30 @@ EOF
 
   cd timesketch
 
-  # Rewrite Timesketch docker-compose to use local mirror for future restarts
+  # Rewrite Timesketch docker-compose to use local mirror
   rewrite_compose_images /opt/timesketch/docker-compose.yml
+
+  # Read actual version tags from the .env file that deploy_timesketch.sh created
+  if [ -n "${REGISTRY_MIRROR:-}" ] && [ -f /opt/timesketch/.env ]; then
+    echo "Pre-pulling Timesketch images with correct version tags..."
+    source /opt/timesketch/.env
+    for spec in \
+      "us-docker.pkg.dev/osdfir-registry/timesketch/timesketch:${TIMESKETCH_VERSION}" \
+      "postgres:${POSTGRES_VERSION}" \
+      "redis:${REDIS_VERSION}" \
+      "opensearchproject/opensearch:${OPENSEARCH_VERSION}" \
+      "nginx:${NGINX_VERSION}"; do
+      MIRRORED=$(mirror_image "$spec")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null && \
+        docker tag "${MIRRORED}" "$spec" 2>/dev/null || \
+        echo "    WARNING: ${MIRRORED} not in mirror — will fall back to internet"
+    done
+  fi
+
+  # Now start Timesketch (deploy script skipped this)
+  echo "Starting Timesketch containers..."
+  docker compose up -d 2>&1 | tee -a /opt/openrelik-pipeline/logs/timesketch-install.log
 
 
   FORMATTER_FILE="/opt/timesketch/etc/timesketch/plaso_formatters.yaml"
@@ -1021,11 +1033,17 @@ else
   echo "  Velociraptor: skipped"
 fi
 
-# Clean up sensitive files — remove vault credentials and config.env
-# These should not persist on the VM after install
+# Clean up sensitive files — always remove vault credentials
 rm -f /etc/azure.cfg 2>/dev/null
 rm -f "${SCRIPT_DIR}/azure.cfg" 2>/dev/null
 [ -n "${AZURE_CFG_ARG}" ] && rm -f "${AZURE_CFG_ARG}" 2>/dev/null
-rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
-echo ""
-echo "Cleanup: azure.cfg and config.env removed"
+
+# Only delete config.env if no components failed — keeps it for re-run on failure
+if [ "${TS_CONFIG_FAILED:-}" != "true" ] && [ "${OR_CONFIG_FAILED:-}" != "true" ] && [ "${VR_CONFIG_FAILED:-}" != "true" ]; then
+  rm -f "${SCRIPT_DIR}/config.env" 2>/dev/null
+  echo ""
+  echo "Cleanup: azure.cfg and config.env removed"
+else
+  echo ""
+  echo "Cleanup: azure.cfg removed. config.env kept for re-run (some components failed)"
+fi
