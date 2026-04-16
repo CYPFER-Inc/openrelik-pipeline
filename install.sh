@@ -763,11 +763,16 @@ if [ "${INSTALL_VR}" = "true" ]; then
   # means we use OIDC against Authentik. Dev uses local auth (Basic, default).
   # oidc_name is "authentik" — this becomes part of the callback URL:
   #   https://{CASE}-vr.dev.cypfer.io/auth/oidc/authentik/callback
+  #
+  # default_roles_for_unknown_user auto-provisions new OIDC users with the
+  # "reader" role on first login. Without it, VR rejects unknown users with
+  # "not registered on this system". Admin can promote users post-login.
+  # Full group→role mapping (claims.role_map) is Phase 4 RBAC.
   VR_GUI_EXTRA=""
   if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_VR_CLIENT_ID:-}" ]; then
     AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
-    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\"}"
-    echo "Velociraptor OIDC enabled (Authentik)"
+    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\", \"default_roles_for_unknown_user\": [\"reader\"]}"
+    echo "Velociraptor OIDC enabled (Authentik), default role for new users: reader"
   elif [ "${ENVIRONMENT}" = "prod" ]; then
     echo "AUTHENTIK_VR_CLIENT_ID not set — Velociraptor using local auth only"
   fi
