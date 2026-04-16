@@ -764,15 +764,25 @@ if [ "${INSTALL_VR}" = "true" ]; then
   # oidc_name is "authentik" — this becomes part of the callback URL:
   #   https://{CASE}-vr.dev.cypfer.io/auth/oidc/authentik/callback
   #
-  # default_roles_for_unknown_user auto-provisions new OIDC users with the
-  # "reader" role on first login. Without it, VR rejects unknown users with
-  # "not registered on this system". Admin can promote users post-login.
-  # Full group→role mapping (claims.role_map) is Phase 4 RBAC.
+  # NOTE on auto-provisioning:
+  # We previously included `default_roles_for_unknown_user: [reader]` here,
+  # but that field is **certificate-only** in Velociraptor (verified against
+  # config.proto field 22 — "If a user presents a certificate but does not
+  # exist in the system, the user will receive a default role"). It is silently
+  # ignored on the OIDC code path.
+  #
+  # Tested on case-2048 (VR 0.76.1, 2026-04-16) with the field set: OIDC users
+  # still get "User <email> is not registered on this system" on first login.
+  # Admin must run `velociraptor user add <email> --role <role>` once per user.
+  #
+  # Real OIDC auto-provisioning needs `claims.role_map` + `override_acls: true`
+  # plus an Authentik scope mapping that emits a roles/groups claim VR can map.
+  # Tracked as Phase 4 RBAC in microcloud/TODO.md.
   VR_GUI_EXTRA=""
   if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_VR_CLIENT_ID:-}" ]; then
     AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
-    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\", \"default_roles_for_unknown_user\": [\"reader\"]}"
-    echo "Velociraptor OIDC enabled (Authentik), default role for new users: reader"
+    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\"}"
+    echo "Velociraptor OIDC enabled (Authentik). New users must be pre-created via 'velociraptor user add' until Phase 4 RBAC."
   elif [ "${ENVIRONMENT}" = "prod" ]; then
     echo "AUTHENTIK_VR_CLIENT_ID not set — Velociraptor using local auth only"
   fi
