@@ -106,3 +106,105 @@ scrape_configs:
           actor: principal
           action: operation
           verdict: verdict_final
+
+  # OpenRelik audit events (v1 — HTTP-derived).
+  # openrelik-server emits only uvicorn access logs to stdout — no
+  # structured audit feed, no authenticated-user info. This scrape
+  # parses the access-log format, filters to meaningful write ops, and
+  # promotes them to the unified schema:
+  #
+  #   INFO:     1.2.3.4:5678 - "POST /api/v1/workflows/ HTTP/1.1" 201 Created
+  #                            ^method  ^path                     ^status
+  #
+  # Gaps acknowledged here (design doc § 6):
+  #   - `actor` is empty — uvicorn doesn't log the authenticated user.
+  #     Either upstream OR adds a middleware that emits structured
+  #     per-request audit events, or we sidecar a proxy-layer enricher.
+  #     For v1 we land the rest of the fields and accept that gap.
+  #   - Client IP is the internal Docker bridge address (nginx proxy
+  #     sits between Cloudflare and OR inside the case container), so
+  #     it isn't useful as audit context.
+  - job_name: openrelik-audit
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: name
+            values: [openrelik-server]
+    relabel_configs:
+      - target_label: 'job'
+        replacement: 'openrelik-audit'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'openrelik'
+      - target_label: 'class'
+        replacement: 'audit'
+    pipeline_stages:
+      # 1. Parse uvicorn access-log lines. Non-matching lines (startup
+      #    banner, celery connect messages, etc.) leave method/path/status
+      #    unset and get dropped below.
+      - regex:
+          expression: '^INFO:\s+(?P<client>[\d.]+(?::\d+)?)\s+-\s+"(?P<method>[A-Z]+)\s+(?P<path>[^"\s]+)\s+HTTP/[0-9.]+"\s+(?P<status>\d{3})'
+      # 2. Force `method` to a defined (possibly empty) string so the
+      #    drop stage can see it even when the regex above didn't match.
+      - template:
+          source: method
+          template: '{{ default "" .method }}'
+      - drop:
+          source: method
+          expression: '^$'
+          drop_counter_reason: non_access_log
+      # 3. Drop noise: health probes, internal polling, read-only GETs
+      #    that aren't downloads/exports.
+      - drop:
+          source: path
+          expression: '^(/healthz|/api/v1/taskqueue/|/api/v1/workflows/templates/|/api/v1/users/me)'
+          drop_counter_reason: healthz_or_polling
+      # 3a. Drop all GETs except those that look like downloads/exports
+      #     (the only read operations we consider audit-worthy).
+      - regex:
+          expression: '(?P<is_download>/(download|export)(?:\b|/))'
+          source: path
+      - template:
+          source: keep_line
+          template: '{{ if or (ne .method "GET") .is_download }}keep{{ end }}'
+      - drop:
+          source: keep_line
+          expression: '^$'
+          drop_counter_reason: readonly_get
+      # 4. Derive action from method+path. Unclassified audit-class
+      #    writes fall back to "api_<method>" so they still land with
+      #    something useful instead of being dropped.
+      - template:
+          source: action_derived
+          template: |
+            {{- $m := .method -}}
+            {{- $p := .path -}}
+            {{- if eq $p "/auth/local" -}}login
+            {{- else if regexMatch "/workflows/[0-9]+/run" $p -}}workflow_run
+            {{- else if and (eq $m "POST") (regexMatch "/workflows/?$" $p) -}}workflow_create
+            {{- else if and (eq $m "DELETE") (regexMatch "/workflows/" $p) -}}workflow_delete
+            {{- else if and (eq $m "POST") (regexMatch "/folders/[0-9]+/files/?$" $p) -}}file_upload
+            {{- else if regexMatch "/(download|export)(?:\b|/)" $p -}}file_download
+            {{- else if and (eq $m "DELETE") (regexMatch "/files/" $p) -}}file_delete
+            {{- else if and (eq $m "POST") (regexMatch "/folders/" $p) -}}folder_create
+            {{- else if and (eq $m "DELETE") (regexMatch "/folders/" $p) -}}folder_delete
+            {{- else -}}api_{{ $m | lower }}
+            {{- end -}}
+      # 5. Derive verdict from status code: 2xx=ok, 4xx=denied, 5xx=error.
+      - template:
+          source: verdict_derived
+          template: |
+            {{- if hasPrefix "2" .status -}}ok
+            {{- else if hasPrefix "4" .status -}}denied
+            {{- else if hasPrefix "5" .status -}}error
+            {{- else -}}{{ .status }}
+            {{- end -}}
+      # 6. Promote to unified-schema labels. No `actor` yet (see notes
+      #    at the top of this scrape — upstream OR gap).
+      - labels:
+          action: action_derived
+          verdict: verdict_derived
