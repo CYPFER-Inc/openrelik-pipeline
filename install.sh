@@ -1051,41 +1051,46 @@ if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${LOKI_URL:-}" ]; then
     echo "  WARN: CASE_ID not set (no /etc/vote-case.env, no env override) — skipping Promtail"
     PROMTAIL_STATUS="skipped (no CASE_ID)"
   else
+    # No wrapping block/tee — install.sh already sets a top-level
+    # `exec > >(tee -a "${MASTER_LOG}") 2>&1` (line ~260), so every
+    # echo here lands in /opt/openrelik-pipeline/logs/install.log
+    # automatically. Piping this block to a separate `tee` forked a
+    # subshell, and the PROMTAIL_STATUS assignments inside never
+    # propagated to the parent — which is why successful deploys
+    # showed "skipped" in the summary line.
     PROMTAIL_DIR="/opt/promtail"
-    {
-      mkdir -p "${PROMTAIL_DIR}/positions"
-      cp "${SCRIPT_DIR}/promtail/docker-compose.yml" "${PROMTAIL_DIR}/docker-compose.yml"
-      # Substitute placeholders. Using # as sed delim so Loki URL's slashes don't conflict.
-      sed -e "s#__LOKI_URL__#${LOKI_URL}#g" \
-          -e "s#__CASE_ID__#${CASE_ID}#g" \
-          "${SCRIPT_DIR}/promtail/promtail-config.yaml" \
-          > "${PROMTAIL_DIR}/promtail-config.yaml"
+    mkdir -p "${PROMTAIL_DIR}/positions"
+    cp "${SCRIPT_DIR}/promtail/docker-compose.yml" "${PROMTAIL_DIR}/docker-compose.yml"
+    # Substitute placeholders. Using # as sed delim so Loki URL's slashes don't conflict.
+    sed -e "s#__LOKI_URL__#${LOKI_URL}#g" \
+        -e "s#__CASE_ID__#${CASE_ID}#g" \
+        "${SCRIPT_DIR}/promtail/promtail-config.yaml" \
+        > "${PROMTAIL_DIR}/promtail-config.yaml"
 
-      cd "${PROMTAIL_DIR}"
-      docker compose pull
-      docker compose up -d
-      # Compose up -d doesn't recreate on mounted-file changes, and
-      # Promtail doesn't hot-reload — force restart so the new config
-      # is always loaded on re-run.
-      docker compose restart promtail
+    cd "${PROMTAIL_DIR}"
+    docker compose pull
+    docker compose up -d
+    # Compose up -d doesn't recreate on mounted-file changes, and
+    # Promtail doesn't hot-reload — force restart so the new config
+    # is always loaded on re-run.
+    docker compose restart promtail
 
-      # Wait for /ready (bound to localhost by compose); fall back to
-      # showing compose logs on failure so the operator has context.
-      for i in $(seq 1 15); do
-        if curl -sf --max-time 2 http://127.0.0.1:9080/ready >/dev/null 2>&1; then
-          echo "  Promtail: ready (case=${CASE_ID})"
-          PROMTAIL_STATUS="OK"
-          break
-        fi
-        if [ "$i" -eq 15 ]; then
-          echo "  WARN: Promtail did not become ready within 30s"
-          docker compose logs --tail 30 promtail 2>&1 | sed 's/^/    /'
-          PROMTAIL_FAILED="true"
-          PROMTAIL_STATUS="FAILED"
-        fi
-        sleep 2
-      done
-    } 2>&1 | tee -a /opt/openrelik-pipeline/logs/promtail-install.log
+    # Wait for /ready (bound to localhost by compose); fall back to
+    # showing compose logs on failure so the operator has context.
+    for i in $(seq 1 15); do
+      if curl -sf --max-time 2 http://127.0.0.1:9080/ready >/dev/null 2>&1; then
+        echo "  Promtail: ready (case=${CASE_ID})"
+        PROMTAIL_STATUS="OK"
+        break
+      fi
+      if [ "$i" -eq 15 ]; then
+        echo "  WARN: Promtail did not become ready within 30s"
+        docker compose logs --tail 30 promtail 2>&1 | sed 's/^/    /'
+        PROMTAIL_FAILED="true"
+        PROMTAIL_STATUS="FAILED"
+      fi
+      sleep 2
+    done
   fi
 elif [ "${ENVIRONMENT}" != "prod" ]; then
   echo ""
