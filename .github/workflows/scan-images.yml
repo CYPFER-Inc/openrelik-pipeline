@@ -139,6 +139,7 @@ jobs:
       - name: Run Trivy scan — ${{ matrix.name }}
         uses: aquasecurity/trivy-action@master
         with:
+          trivy-version: "latest"
           image-ref: ${{ matrix.image }}
           format: "sarif"
           output: "trivy-${{ matrix.name }}.sarif"
@@ -202,6 +203,7 @@ jobs:
       - name: Run Trivy scan on pipeline image
         uses: aquasecurity/trivy-action@master
         with:
+          trivy-version: "latest"
           image-ref: "ghcr.io/${{ steps.org-name.outputs.value }}/openrelik-pipeline:latest"
           format: "sarif"
           output: "trivy-pipeline.sarif"
