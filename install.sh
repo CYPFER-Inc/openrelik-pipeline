@@ -1034,6 +1034,86 @@ if [ "${INSTALL_TS}" = "true" ]; then
   fi
 fi
 
+# ─── Observability: Timesketch audit tailer ──────────────────────────────────
+# Deploys the ts-audit-tailer sidecar that polls TS Postgres and emits
+# AUDIT-prefixed JSON to stdout (Promtail catches it via Docker SD).
+# Gated the same as Promtail (prod + LOKI_URL) AND requires TS to have
+# been installed and ts-config to have succeeded — otherwise the
+# `timesketch_default` network doesn't exist and there's nothing to tail.
+TS_AUDIT_STATUS="skipped"
+if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${LOKI_URL:-}" ] \
+   && [ "${INSTALL_TS}" = "true" ] && [ "${TS_CONFIG_FAILED:-}" != "true" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════"
+  echo "Deploying ts-audit-tailer (TS DB → Loki sidecar)"
+  echo "═══════════════════════════════════════════════════"
+
+  # Source case metadata (same as Promtail step below).
+  if [ -f /etc/vote-case.env ]; then
+    # shellcheck disable=SC1091
+    source /etc/vote-case.env
+  fi
+
+  if [ -z "${CASE_ID:-}" ]; then
+    echo "  WARN: CASE_ID not set — skipping ts-audit-tailer"
+    TS_AUDIT_STATUS="skipped (no CASE_ID)"
+  else
+    # Pull the TS Postgres password straight out of the running container
+    # (deploy_timesketch.sh writes it into the container's environment).
+    TS_DB_PASS=$(docker inspect postgres --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                  | grep '^POSTGRES_PASSWORD=' | cut -d= -f2-)
+    if [ -z "${TS_DB_PASS}" ]; then
+      echo "  WARN: could not read POSTGRES_PASSWORD from 'postgres' container — skipping"
+      TS_AUDIT_STATUS="skipped (no DB_PASS)"
+    else
+      TAILER_DIR="/opt/ts-audit-tailer"
+      mkdir -p "${TAILER_DIR}/state"
+      cp -r "${SCRIPT_DIR}/ts-audit-tailer/." "${TAILER_DIR}/"
+      # Write the tailer's env file (secrets stay off the command line
+      # and out of docker inspect for the main environment).
+      umask 077
+      cat > "${TAILER_DIR}/.env" <<EOF
+DB_PASS=${TS_DB_PASS}
+CASE_ID=${CASE_ID}
+EOF
+      umask 022
+
+      (
+        cd "${TAILER_DIR}"
+        # Build the sidecar image locally (tiny — python:3.12-slim +
+        # psycopg2-binary). `docker compose build` is idempotent.
+        docker compose build
+        docker compose up -d
+      )
+
+      # Quick smoke check: container up within 30s? A DB-unreachable
+      # tailer is still "running" — failure mode is stderr spam, not
+      # container exit. So we only verify presence, not log contents.
+      for i in $(seq 1 15); do
+        if docker ps --filter name=ts-audit-tailer --filter status=running -q | grep -q .; then
+          echo "  ts-audit-tailer: running (case=${CASE_ID})"
+          TS_AUDIT_STATUS="OK"
+          break
+        fi
+        if [ "$i" -eq 15 ]; then
+          echo "  WARN: ts-audit-tailer did not enter running state within 30s"
+          docker logs --tail 20 ts-audit-tailer 2>&1 | sed 's/^/    /'
+          TS_AUDIT_STATUS="FAILED"
+        fi
+        sleep 2
+      done
+    fi
+  fi
+elif [ "${ENVIRONMENT}" != "prod" ]; then
+  TS_AUDIT_STATUS="skipped (dev)"
+elif [ -z "${LOKI_URL:-}" ]; then
+  TS_AUDIT_STATUS="skipped (no LOKI_URL)"
+elif [ "${INSTALL_TS}" != "true" ]; then
+  TS_AUDIT_STATUS="skipped (TS not installed)"
+elif [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
+  TS_AUDIT_STATUS="skipped (TS config failed)"
+fi
+
 # ─── Observability: Promtail log shipper ─────────────────────────────────────
 # Deploys Promtail inside the case container so every Docker container's
 # stdout ships to Loki on services-1 with case=<CASE_ID> labels. Gated
@@ -1143,6 +1223,7 @@ else
 fi
 
 echo "  Promtail:     ${PROMTAIL_STATUS}"
+echo "  TS Audit:     ${TS_AUDIT_STATUS}"
 
 # Clean up sensitive files — always remove vault credentials
 rm -f /etc/azure.cfg 2>/dev/null

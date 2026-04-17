@@ -208,3 +208,66 @@ scrape_configs:
       - labels:
           action: action_derived
           verdict: verdict_derived
+
+  # Timesketch audit events — emitted by the ts-audit-tailer sidecar.
+  # TS has no structured audit feed; the sidecar polls the Postgres
+  # `searchhistory` and `analysissession` tables and prints lines of
+  # the form:
+  #
+  #   AUDIT {"ts":"…","event":"sketch_search","actor":"…",
+  #          "sketch_id":5,"sketch_name":"…","query":"…","result_count":42}
+  #
+  # Non-AUDIT lines from the sidecar (startup message, psycopg
+  # reconnect warnings) are dropped at ingest — they'd be ops-class,
+  # not audit.
+  - job_name: timesketch-audit
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: name
+            values: [ts-audit-tailer]
+    relabel_configs:
+      - target_label: 'job'
+        replacement: 'timesketch-audit'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'timesketch'
+      - target_label: 'class'
+        replacement: 'audit'
+    pipeline_stages:
+      # Keep only AUDIT-prefixed lines; drop the rest so the sidecar's
+      # own ops logging doesn't pollute audit queries.
+      - regex:
+          expression: '^AUDIT (?P<audit_json>\{.*\})\s*$'
+      - template:
+          source: audit_json
+          template: '{{ default "" .audit_json }}'
+      - drop:
+          source: audit_json
+          expression: '^$'
+          drop_counter_reason: non_audit_line
+      - json:
+          source: audit_json
+          expressions:
+            ts: ts
+            event: event
+            actor: actor
+      # sketch_id/query/result_count stay in the log body as JSON —
+      # sketch_id cardinality would blow up the label count. Query-time
+      # filtering with `| json | sketch_id="5"` still works.
+      - timestamp:
+          source: ts
+          format: RFC3339
+      # verdict is always ok — a row in the DB means the action
+      # succeeded. TS doesn't record failed searches this way.
+      - template:
+          source: verdict_static
+          template: 'ok'
+      - labels:
+          actor:
+          action: event
+          verdict: verdict_static

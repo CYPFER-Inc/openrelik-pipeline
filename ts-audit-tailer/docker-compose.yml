@@ -1,0 +1,37 @@
+# ts-audit-tailer — polls Timesketch Postgres for audit events and
+# emits AUDIT-prefixed JSON lines on stdout. Promtail's Docker SD
+# picks them up via the timesketch-audit scrape (see promtail/).
+#
+# Deployed by install.sh's deploy_ts_audit_tailer() only when
+# ENVIRONMENT=prod + LOKI_URL set (same gate as Promtail itself,
+# plus Timesketch having been installed successfully).
+#
+# Network: joins `timesketch_default` (external) so it can reach
+# the TS Postgres container by its DNS name `postgres`. The TS
+# compose project must exist already; install.sh orders deploys
+# accordingly.
+
+services:
+  ts-audit-tailer:
+    container_name: ts-audit-tailer
+    build: .
+    image: ts-audit-tailer:local
+    restart: unless-stopped
+    networks:
+      - timesketch_default
+    env_file:
+      - .env
+    environment:
+      DB_HOST: postgres
+      DB_NAME: timesketch
+      DB_USER: timesketch
+      # DB_PASS comes from .env (written by deploy_ts_audit_tailer)
+      CASE_ID: ${CASE_ID}
+      POLL_SECONDS: 10
+      STATE_FILE: /state/position.json
+    volumes:
+      - ./state:/state
+
+networks:
+  timesketch_default:
+    external: true
