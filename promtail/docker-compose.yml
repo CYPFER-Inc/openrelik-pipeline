@@ -22,10 +22,17 @@ services:
       # openrelik-pipeline, …).
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      # VR journal path — bind-mounted here so a future scrape_config
-      # can tail /opt/vr_data/logs/server.journal.tsv without further
-      # deploy changes. Currently unused; see Phase-2 follow-up.
-      - /opt/vr_data:/opt/vr_data:ro
+      # Velociraptor data directory on the LXC host. The vr_data/logs/
+      # subdir holds per-component audit trails we tail here:
+      #   VelociraptorAudit_info.log   — hunt creation, flow uploads,
+      #                                  monitoring state changes, user auth
+      #   VelociraptorAudit_error.log  — audit-class failures (auth deny, etc.)
+      # Both are JSON-per-line. Rotated archives (*.log.YYYYMMDDHHMM) are
+      # not tailed — the scrape glob deliberately excludes date-suffixed
+      # files so Promtail doesn't double-ingest historical windows.
+      # (The old /opt/vr_data mount from PR #17 was wrong — that path is
+      # empty on the LXC host; VR writes inside /opt/velociraptor/.)
+      - /opt/velociraptor/vr_data:/opt/velociraptor/vr_data:ro
       - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
       - ./positions:/positions
     # Scratch image has no wget/curl — bind health port on localhost

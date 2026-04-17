@@ -51,8 +51,58 @@ scrape_configs:
       - target_label: 'class'
         replacement: 'ops'
 
-  # install.sh's own log — captures the full deploy timeline per case.
-  # Lives on the LXC host, mounted into this Promtail container via the
-  # compose file (/var/log is NOT mounted currently — only Docker paths
-  # and /opt/vr_data. Install log access is a small follow-up if we want
-  # it; leaving off for now to keep this PR scoped to the plumbing).
+  # Velociraptor audit log — chain-of-custody for VR operations.
+  # VR writes JSON-per-line to /opt/vr_data/logs/VelociraptorAudit_{info,error}.log
+  # inside the container (= /opt/velociraptor/vr_data/logs/ on the host,
+  # bind-mounted by the compose file).
+  # Fields seen in practice:
+  #   time         — RFC3339 timestamp
+  #   principal    — VR username who performed the action
+  #   operation    — e.g. CreateHunt, SetServerMonitoringState, client ops
+  #   msg          — usually mirrors operation
+  #   level        — info | error (also distinguishable via the filename)
+  #   details      — operation-specific nested object (stays in log body)
+  #
+  # __path__ uses the bare `.log` glob so rotated archives
+  # (VelociraptorAudit_info.log.202604130000) are NOT re-ingested.
+  - job_name: velociraptor-audit
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: velociraptor-audit
+          case: __CASE_ID__
+          host: case-__CASE_ID__
+          source: velociraptor
+          class: audit
+          __path__: /opt/velociraptor/vr_data/logs/VelociraptorAudit_*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: time
+            principal: principal
+            operation: operation
+            level: level
+      # Derive verdict from filename: *_info.log → ok, *_error.log → error
+      - regex:
+          expression: 'VelociraptorAudit_(?P<verdict_from_file>info|error)\.log$'
+          source: filename
+      # Prefer the file-based verdict; fall back to level if missing.
+      - template:
+          source: verdict_final
+          template: '{{ or .verdict_from_file .level "ok" }}'
+      # Normalize "info" → "ok" to match the unified schema's verdict set.
+      - template:
+          source: verdict_final
+          template: '{{ if eq .verdict_final "info" }}ok{{ else }}{{ .verdict_final }}{{ end }}'
+      # Use the event's own timestamp so backlogged lines land on the
+      # right Grafana timeline, not Promtail ingest time.
+      - timestamp:
+          source: ts
+          format: RFC3339
+      # Promote to unified-schema labels. `source`, `class`, `case`, `host`
+      # are already set statically above.
+      - labels:
+          actor: principal
+          action: operation
+          verdict: verdict_final
