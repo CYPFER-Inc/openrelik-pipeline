@@ -1,0 +1,58 @@
+# Promtail config for a case container.
+# __LOKI_URL__ and __CASE_ID__ are substituted by install.sh at deploy time.
+#
+# Every Docker container on this LXC gets auto-discovered and its
+# stdout shipped to Loki with:
+#   source=case-container  class=ops
+#   case=<CASE_ID>  host=case-<CASE_ID>
+#   container=<docker-name>  compose_project=<...>  compose_service=<...>
+#
+# Audit-class parsing (source-specific) is added in follow-up PRs.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /positions/positions.yaml
+
+clients:
+  - url: __LOKI_URL__/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+scrape_configs:
+  # All Docker containers on the case LXC
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: 'compose_project'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'compose_service'
+      - target_label: 'job'
+        replacement: 'docker'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'case-container'
+      - target_label: 'class'
+        replacement: 'ops'
+
+  # install.sh's own log — captures the full deploy timeline per case.
+  # Lives on the LXC host, mounted into this Promtail container via the
+  # compose file (/var/log is NOT mounted currently — only Docker paths
+  # and /opt/vr_data. Install log access is a small follow-up if we want
+  # it; leaving off for now to keep this PR scoped to the plumbing).
