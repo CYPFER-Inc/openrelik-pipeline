@@ -29,6 +29,12 @@ on:
     branches:
       - main
 
+  # Weekly rebuild so Debian security patches land in the image even when
+  # nothing has been merged. The scan workflow runs at 07:00 UTC on Mondays;
+  # build at 06:00 so the scan sees the fresh image.
+  schedule:
+    - cron: "0 6 * * 1"
+
   workflow_dispatch:
     inputs:
       push_image:
@@ -118,6 +124,7 @@ jobs:
             BUILD_DATE=${{ github.event.repository.updated_at }}
             VCS_REF=${{ github.sha }}
             VERSION=${{ steps.meta.outputs.version }}
+            APT_CACHE_BUST=${{ github.run_id }}
 
       - name: Log digest to summary
         if: github.event_name != 'pull_request'
