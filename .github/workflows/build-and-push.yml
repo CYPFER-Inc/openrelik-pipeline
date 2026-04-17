@@ -168,6 +168,7 @@ jobs:
         id: trivy-scan
         uses: aquasecurity/trivy-action@master
         with:
+          trivy-version: "latest"
           image-ref: "${{ env.REGISTRY }}/${{ steps.image-name.outputs.value }}@${{ needs.build-and-push.outputs.image-digest }}"
           format: table
           severity: "CRITICAL,HIGH"
