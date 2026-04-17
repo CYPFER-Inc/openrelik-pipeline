@@ -429,6 +429,12 @@ EOF
     # Hosted domain — not applicable for Authentik, clear it
     sed -i "s|^GOOGLE_OIDC_HOSTED_DOMAIN = .*|GOOGLE_OIDC_HOSTED_DOMAIN = ''|" "$TS_CONF"
 
+    # Allow the `admin` service account to keep using local auth once OIDC is
+    # enabled. The openrelik-pipeline container logs in as admin/password via
+    # timesketch-api-client; without this, Timesketch aborts with
+    # "Local authentication is disabled for this user. Please use OAuth."
+    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin']|" "$TS_CONF"
+
     # Restart Timesketch to pick up OIDC config
     cd /opt/timesketch
     docker compose restart timesketch-web
