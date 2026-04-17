@@ -1,0 +1,34 @@
+# Promtail inside a case container — ships all Docker stdout to Loki
+# on services-1 with a `case=<CASE_ID>` label.
+#
+# Deployed by install.sh's deploy_promtail() on prod case containers
+# only (gated by ENVIRONMENT=prod + LOKI_URL set). Dev deployments
+# skip Promtail entirely.
+#
+# This is the *plumbing* stack — every Docker container's stdout
+# lands in Loki tagged with the case ID. App-specific parsing
+# (VR server.journal.tsv, OR workflow lifecycle, TS DB sidecar)
+# lands in later PRs that extend this config.
+
+services:
+  promtail:
+    container_name: case-promtail
+    image: grafana/promtail:3.3.2
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yaml
+    volumes:
+      # Docker service discovery + log file access for all containers
+      # running in this case (timesketch, openrelik, velociraptor,
+      # openrelik-pipeline, …).
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # VR journal path — bind-mounted here so a future scrape_config
+      # can tail /opt/vr_data/logs/server.journal.tsv without further
+      # deploy changes. Currently unused; see Phase-2 follow-up.
+      - /opt/vr_data:/opt/vr_data:ro
+      - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - ./positions:/positions
+    # Scratch image has no wget/curl — bind health port on localhost
+    # so the install.sh deploy function can probe /ready.
+    ports:
+      - "127.0.0.1:9080:9080"

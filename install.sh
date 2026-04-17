@@ -1028,6 +1028,75 @@ if [ "${INSTALL_TS}" = "true" ]; then
   fi
 fi
 
+# ─── Observability: Promtail log shipper ─────────────────────────────────────
+# Deploys Promtail inside the case container so every Docker container's
+# stdout ships to Loki on services-1 with case=<CASE_ID> labels. Gated
+# on ENVIRONMENT=prod AND LOKI_URL set — dev and air-gapped installs skip.
+# This is the plumbing-only tier: no app-specific parsing yet.
+PROMTAIL_FAILED=""
+PROMTAIL_STATUS="skipped"
+if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${LOKI_URL:-}" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════"
+  echo "Deploying Promtail (log shipper → ${LOKI_URL})"
+  echo "═══════════════════════════════════════════════════"
+
+  # Case ID: prefer /etc/vote-case.env (vote-managed), fall back to
+  # CASE_ID already in env (manual deploys with CASE_ID= set).
+  if [ -f /etc/vote-case.env ]; then
+    # shellcheck disable=SC1091
+    source /etc/vote-case.env
+  fi
+  if [ -z "${CASE_ID:-}" ]; then
+    echo "  WARN: CASE_ID not set (no /etc/vote-case.env, no env override) — skipping Promtail"
+    PROMTAIL_STATUS="skipped (no CASE_ID)"
+  else
+    PROMTAIL_DIR="/opt/promtail"
+    {
+      mkdir -p "${PROMTAIL_DIR}/positions"
+      cp "${SCRIPT_DIR}/promtail/docker-compose.yml" "${PROMTAIL_DIR}/docker-compose.yml"
+      # Substitute placeholders. Using # as sed delim so Loki URL's slashes don't conflict.
+      sed -e "s#__LOKI_URL__#${LOKI_URL}#g" \
+          -e "s#__CASE_ID__#${CASE_ID}#g" \
+          "${SCRIPT_DIR}/promtail/promtail-config.yaml" \
+          > "${PROMTAIL_DIR}/promtail-config.yaml"
+
+      cd "${PROMTAIL_DIR}"
+      docker compose pull
+      docker compose up -d
+      # Compose up -d doesn't recreate on mounted-file changes, and
+      # Promtail doesn't hot-reload — force restart so the new config
+      # is always loaded on re-run.
+      docker compose restart promtail
+
+      # Wait for /ready (bound to localhost by compose); fall back to
+      # showing compose logs on failure so the operator has context.
+      for i in $(seq 1 15); do
+        if curl -sf --max-time 2 http://127.0.0.1:9080/ready >/dev/null 2>&1; then
+          echo "  Promtail: ready (case=${CASE_ID})"
+          PROMTAIL_STATUS="OK"
+          break
+        fi
+        if [ "$i" -eq 15 ]; then
+          echo "  WARN: Promtail did not become ready within 30s"
+          docker compose logs --tail 30 promtail 2>&1 | sed 's/^/    /'
+          PROMTAIL_FAILED="true"
+          PROMTAIL_STATUS="FAILED"
+        fi
+        sleep 2
+      done
+    } 2>&1 | tee -a /opt/openrelik-pipeline/logs/promtail-install.log
+  fi
+elif [ "${ENVIRONMENT}" != "prod" ]; then
+  echo ""
+  echo "Promtail: skipped (ENVIRONMENT=${ENVIRONMENT}, not prod)"
+  PROMTAIL_STATUS="skipped (dev)"
+elif [ -z "${LOKI_URL:-}" ]; then
+  echo ""
+  echo "Promtail: skipped (LOKI_URL not set in config.env)"
+  PROMTAIL_STATUS="skipped (no LOKI_URL)"
+fi
+
 echo "═══════════════════════════════════════════════════"
 echo "Install complete"
 
@@ -1061,6 +1130,8 @@ if [ "${INSTALL_VR}" = "true" ]; then
 else
   echo "  Velociraptor: skipped"
 fi
+
+echo "  Promtail:     ${PROMTAIL_STATUS}"
 
 # Clean up sensitive files — always remove vault credentials
 rm -f /etc/azure.cfg 2>/dev/null
