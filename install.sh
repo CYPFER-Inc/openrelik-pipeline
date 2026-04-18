@@ -759,11 +759,28 @@ if [ "${INSTALL_VR}" = "true" ]; then
       VR_CLIENT_PORT="8443"
       VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
       VELOCIRAPTOR_PUBLIC_URL="https://${CASE_DOMAIN}"
+      # Dash-free TLS identity for the VR agent. Required because:
+      #   - VR agent CN-checks /server.pem against Client.pinned_server_name
+      #   - OrgIdFromClientId splits the destination on "-" and treats the
+      #     suffix as an org_id (client-side lookup fails → "Org not found")
+      # The DNS hostname VR_CLIENT_DOMAIN still has dashes (existing pattern);
+      # the agent's TLS SNI (= pinned name) goes through nginx as a second
+      # entry in the stream SNI map (see microcloud case-stream.conf.tmpl).
+      # Root cause + fix validated on case-2067, 2026-04-18.
+      VR_PINNED_NAME="vr${CASE_ID}.client.${CASE_DOMAIN#*-vr.}"
+      # Fallback if parsing above didn't yield a reasonable value
+      [[ "$VR_PINNED_NAME" != *.* ]] && VR_PINNED_NAME="vr${CASE_ID}.client.dev.cypfer.io"
       echo "Vote case detected:"
       echo "  VR GUI:    ${CASE_DOMAIN} (Cloudflare → nginx → :8889)"
       echo "  VR Client: ${VR_CLIENT_DOMAIN}:8443 (grey cloud → nginx SNI → :8443)"
+      echo "  VR SNI/CN: ${VR_PINNED_NAME} (dash-free; see nginx stream map)"
     fi
   fi
+
+  # VR_PINNED_NAME defaults to empty for non-vote deploys (dev); the entrypoint
+  # skips the cert surgery when empty and VR uses its built-in CN
+  # (VelociraptorServer) — fine for local-only access.
+  VR_PINNED_NAME="${VR_PINNED_NAME:-}"
 
   # Build VR authenticator JSON for --merge. Prod + AUTHENTIK_VR_CLIENT_ID set
   # means we use OIDC against Authentik. Dev uses local auth (Basic, default).
@@ -813,11 +830,13 @@ if [ "${INSTALL_VR}" = "true" ]; then
       - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
 
   VR_BASE_IMAGE=$(mirror_image "ubuntu:22.04")
+  # openssl + python3 + python3-yaml are needed for the per-case Frontend cert
+  # regeneration below (runs once on first container boot, in the entrypoint).
   echo "FROM ${VR_BASE_IMAGE}
 COPY ./entrypoint .
 RUN chmod +x entrypoint && \
     apt update && \
-    apt install -y curl wget jq
+    apt install -y curl wget jq openssl python3 python3-yaml
 WORKDIR /
 CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
 
@@ -844,6 +863,66 @@ if [ ! -f server.config.yaml ]; then
     "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
+
+  # === Per-case Frontend cert with dash-free CN (VR agent compat) ===
+  # VR agent performs a CN check on /server.pem against Client.pinned_server_name
+  # (http_comms/comms.go:655), and its OrgIdFromClientId (utils/orgs.go:30) splits
+  # the destination on "-" and treats anything after the first dash as an org_id.
+  # If the CN (= pinned name) has a dash, client-side Encrypt fails with
+  # "Org not found" before any traffic reaches the server. Our nginx routes by SNI
+  # so we need a dash-free CN that also matches pinned_server_name.
+  #
+  # Cert SANs cover all three identities:
+  #   - VR_PINNED_NAME (dash-free)         → agent's SNI + CN check + pinned name
+  #   - VR_CLIENT_DOMAIN (has dashes)      → agent's URL host (DNS target); also
+  #                                          lets nginx's SNI map accept that name
+  #                                          for backwards-compat with older agents
+  #   - VelociraptorServer                 → VR's internal gRPC SAN requirement
+  #
+  # CA private key comes from the freshly-generated config; we kept the chain
+  # intact so the agent's bundled ca_certificate still trusts the new leaf.
+  # Root cause + fix validated live on case-2067 (2026-04-18). PR link in commit.
+  if [ -n "${VR_PINNED_NAME}" ]; then
+    echo "Regenerating Frontend cert with dash-free CN: ${VR_PINNED_NAME}"
+    python3 - <<'PYEOF'
+import yaml
+p = "/opt/server.config.yaml"
+c = yaml.safe_load(open(p))
+open("/opt/ca.crt","w").write(c["Client"]["ca_certificate"])
+open("/opt/ca.key","w").write(c["CA"]["private_key"])
+PYEOF
+    openssl genrsa -traditional -out /opt/fe.key 2048 2>/dev/null
+    openssl req -new -key /opt/fe.key -out /opt/fe.csr \
+      -subj "/O=Velociraptor/CN=${VR_PINNED_NAME}" 2>/dev/null
+    cat > /opt/ext.cnf <<EXT
+subjectAltName=DNS:${VR_PINNED_NAME},DNS:${VR_CLIENT_DOMAIN},DNS:VelociraptorServer
+extendedKeyUsage=serverAuth
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+EXT
+    openssl x509 -req -in /opt/fe.csr -CA /opt/ca.crt -CAkey /opt/ca.key \
+      -CAcreateserial -out /opt/fe.crt -days 365 -sha256 -extfile /opt/ext.cnf 2>/dev/null
+    python3 - <<'PYEOF'
+import yaml
+class L(str): pass
+yaml.add_representer(L, lambda d,x: d.represent_scalar("tag:yaml.org,2002:str", x, style="|"))
+p = "/opt/server.config.yaml"
+c = yaml.safe_load(open(p))
+c["Frontend"]["certificate"] = L(open("/opt/fe.crt").read())
+c["Frontend"]["private_key"] = L(open("/opt/fe.key").read())
+c["Client"]["pinned_server_name"] = "${VR_PINNED_NAME}"
+# Force block-literal style on all large PEM-bearing strings so the rewritten
+# YAML round-trips through VR's parser (VR's RSA PRIVATE KEY parser is picky
+# about quoted-string newline encodings).
+for sec in ["CA","Client","GUI","API","Frontend"]:
+    for k,v in (c.get(sec) or {}).items():
+        if isinstance(v,str) and ("BEGIN" in v or len(v)>200):
+            c[sec][k]=L(v)
+yaml.dump(c, open(p,"w"), default_flow_style=False, sort_keys=False, width=10000)
+PYEOF
+    rm -f /opt/ca.crt /opt/ca.key /opt/fe.key /opt/fe.csr /opt/fe.crt /opt/ext.cnf /opt/ca.srl
+    echo "Frontend cert regenerated; pinned_server_name set to ${VR_PINNED_NAME}"
+  fi
 
   ./velociraptor --config /opt/server.config.yaml user add admin "$VELOCIRAPTOR_PASSWORD" --role administrator
 fi
