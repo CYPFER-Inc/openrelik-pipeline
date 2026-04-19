@@ -429,6 +429,12 @@ EOF
     # Hosted domain — not applicable for Authentik, clear it
     sed -i "s|^GOOGLE_OIDC_HOSTED_DOMAIN = .*|GOOGLE_OIDC_HOSTED_DOMAIN = ''|" "$TS_CONF"
 
+    # Allow the `admin` service account to keep using local auth once OIDC is
+    # enabled. The openrelik-pipeline container logs in as admin/password via
+    # timesketch-api-client; without this, Timesketch aborts with
+    # "Local authentication is disabled for this user. Please use OAuth."
+    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin']|" "$TS_CONF"
+
     # Restart Timesketch to pick up OIDC config
     cd /opt/timesketch
     docker compose restart timesketch-web
@@ -753,26 +759,53 @@ if [ "${INSTALL_VR}" = "true" ]; then
       VR_CLIENT_PORT="8443"
       VR_CLIENT_URL="https://${VR_CLIENT_DOMAIN}:8443/"
       VELOCIRAPTOR_PUBLIC_URL="https://${CASE_DOMAIN}"
+      # Dash-free TLS identity for the VR agent. Required because:
+      #   - VR agent CN-checks /server.pem against Client.pinned_server_name
+      #   - OrgIdFromClientId splits the destination on "-" and treats the
+      #     suffix as an org_id (client-side lookup fails → "Org not found")
+      # The DNS hostname VR_CLIENT_DOMAIN still has dashes (existing pattern);
+      # the agent's TLS SNI (= pinned name) goes through nginx as a second
+      # entry in the stream SNI map (see microcloud case-stream.conf.tmpl).
+      # Root cause + fix validated on case-2067, 2026-04-18.
+      VR_PINNED_NAME="vr${CASE_ID}.client.${CASE_DOMAIN#*-vr.}"
+      # Fallback if parsing above didn't yield a reasonable value
+      [[ "$VR_PINNED_NAME" != *.* ]] && VR_PINNED_NAME="vr${CASE_ID}.client.dev.cypfer.io"
       echo "Vote case detected:"
       echo "  VR GUI:    ${CASE_DOMAIN} (Cloudflare → nginx → :8889)"
       echo "  VR Client: ${VR_CLIENT_DOMAIN}:8443 (grey cloud → nginx SNI → :8443)"
+      echo "  VR SNI/CN: ${VR_PINNED_NAME} (dash-free; see nginx stream map)"
     fi
   fi
+
+  # VR_PINNED_NAME defaults to empty for non-vote deploys (dev); the entrypoint
+  # skips the cert surgery when empty and VR uses its built-in CN
+  # (VelociraptorServer) — fine for local-only access.
+  VR_PINNED_NAME="${VR_PINNED_NAME:-}"
 
   # Build VR authenticator JSON for --merge. Prod + AUTHENTIK_VR_CLIENT_ID set
   # means we use OIDC against Authentik. Dev uses local auth (Basic, default).
   # oidc_name is "authentik" — this becomes part of the callback URL:
   #   https://{CASE}-vr.dev.cypfer.io/auth/oidc/authentik/callback
   #
-  # default_roles_for_unknown_user auto-provisions new OIDC users with the
-  # "reader" role on first login. Without it, VR rejects unknown users with
-  # "not registered on this system". Admin can promote users post-login.
-  # Full group→role mapping (claims.role_map) is Phase 4 RBAC.
+  # NOTE on auto-provisioning:
+  # We previously included `default_roles_for_unknown_user: [reader]` here,
+  # but that field is **certificate-only** in Velociraptor (verified against
+  # config.proto field 22 — "If a user presents a certificate but does not
+  # exist in the system, the user will receive a default role"). It is silently
+  # ignored on the OIDC code path.
+  #
+  # Tested on case-2048 (VR 0.76.1, 2026-04-16) with the field set: OIDC users
+  # still get "User <email> is not registered on this system" on first login.
+  # Admin must run `velociraptor user add <email> --role <role>` once per user.
+  #
+  # Real OIDC auto-provisioning needs `claims.role_map` + `override_acls: true`
+  # plus an Authentik scope mapping that emits a roles/groups claim VR can map.
+  # Tracked as Phase 4 RBAC in microcloud/TODO.md.
   VR_GUI_EXTRA=""
   if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_VR_CLIENT_ID:-}" ]; then
     AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
-    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\", \"default_roles_for_unknown_user\": [\"reader\"]}"
-    echo "Velociraptor OIDC enabled (Authentik), default role for new users: reader"
+    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\"}"
+    echo "Velociraptor OIDC enabled (Authentik). New users must be pre-created via 'velociraptor user add' until Phase 4 RBAC."
   elif [ "${ENVIRONMENT}" = "prod" ]; then
     echo "AUTHENTIK_VR_CLIENT_ID not set — Velociraptor using local auth only"
   fi
@@ -797,11 +830,13 @@ if [ "${INSTALL_VR}" = "true" ]; then
       - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
 
   VR_BASE_IMAGE=$(mirror_image "ubuntu:22.04")
+  # openssl + python3 + python3-yaml are needed for the per-case Frontend cert
+  # regeneration below (runs once on first container boot, in the entrypoint).
   echo "FROM ${VR_BASE_IMAGE}
 COPY ./entrypoint .
 RUN chmod +x entrypoint && \
     apt update && \
-    apt install -y curl wget jq
+    apt install -y curl wget jq openssl python3 python3-yaml
 WORKDIR /
 CMD [\"/entrypoint\"]" | sudo tee ./Dockerfile > /dev/null
 
@@ -828,6 +863,66 @@ if [ ! -f server.config.yaml ]; then
     "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
+
+  # === Per-case Frontend cert with dash-free CN (VR agent compat) ===
+  # VR agent performs a CN check on /server.pem against Client.pinned_server_name
+  # (http_comms/comms.go:655), and its OrgIdFromClientId (utils/orgs.go:30) splits
+  # the destination on "-" and treats anything after the first dash as an org_id.
+  # If the CN (= pinned name) has a dash, client-side Encrypt fails with
+  # "Org not found" before any traffic reaches the server. Our nginx routes by SNI
+  # so we need a dash-free CN that also matches pinned_server_name.
+  #
+  # Cert SANs cover all three identities:
+  #   - VR_PINNED_NAME (dash-free)         → agent's SNI + CN check + pinned name
+  #   - VR_CLIENT_DOMAIN (has dashes)      → agent's URL host (DNS target); also
+  #                                          lets nginx's SNI map accept that name
+  #                                          for backwards-compat with older agents
+  #   - VelociraptorServer                 → VR's internal gRPC SAN requirement
+  #
+  # CA private key comes from the freshly-generated config; we kept the chain
+  # intact so the agent's bundled ca_certificate still trusts the new leaf.
+  # Root cause + fix validated live on case-2067 (2026-04-18). PR link in commit.
+  if [ -n "${VR_PINNED_NAME}" ]; then
+    echo "Regenerating Frontend cert with dash-free CN: ${VR_PINNED_NAME}"
+    python3 - <<'PYEOF'
+import yaml
+p = "/opt/server.config.yaml"
+c = yaml.safe_load(open(p))
+open("/opt/ca.crt","w").write(c["Client"]["ca_certificate"])
+open("/opt/ca.key","w").write(c["CA"]["private_key"])
+PYEOF
+    openssl genrsa -traditional -out /opt/fe.key 2048 2>/dev/null
+    openssl req -new -key /opt/fe.key -out /opt/fe.csr \
+      -subj "/O=Velociraptor/CN=${VR_PINNED_NAME}" 2>/dev/null
+    cat > /opt/ext.cnf <<EXT
+subjectAltName=DNS:${VR_PINNED_NAME},DNS:${VR_CLIENT_DOMAIN},DNS:VelociraptorServer
+extendedKeyUsage=serverAuth
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+EXT
+    openssl x509 -req -in /opt/fe.csr -CA /opt/ca.crt -CAkey /opt/ca.key \
+      -CAcreateserial -out /opt/fe.crt -days 365 -sha256 -extfile /opt/ext.cnf 2>/dev/null
+    python3 - <<'PYEOF'
+import yaml
+class L(str): pass
+yaml.add_representer(L, lambda d,x: d.represent_scalar("tag:yaml.org,2002:str", x, style="|"))
+p = "/opt/server.config.yaml"
+c = yaml.safe_load(open(p))
+c["Frontend"]["certificate"] = L(open("/opt/fe.crt").read())
+c["Frontend"]["private_key"] = L(open("/opt/fe.key").read())
+c["Client"]["pinned_server_name"] = "${VR_PINNED_NAME}"
+# Force block-literal style on all large PEM-bearing strings so the rewritten
+# YAML round-trips through VR's parser (VR's RSA PRIVATE KEY parser is picky
+# about quoted-string newline encodings).
+for sec in ["CA","Client","GUI","API","Frontend"]:
+    for k,v in (c.get(sec) or {}).items():
+        if isinstance(v,str) and ("BEGIN" in v or len(v)>200):
+            c[sec][k]=L(v)
+yaml.dump(c, open(p,"w"), default_flow_style=False, sort_keys=False, width=10000)
+PYEOF
+    rm -f /opt/ca.crt /opt/ca.key /opt/fe.key /opt/fe.csr /opt/fe.crt /opt/ext.cnf /opt/ca.srl
+    echo "Frontend cert regenerated; pinned_server_name set to ${VR_PINNED_NAME}"
+  fi
 
   ./velociraptor --config /opt/server.config.yaml user add admin "$VELOCIRAPTOR_PASSWORD" --role administrator
 fi
@@ -1018,6 +1113,160 @@ if [ "${INSTALL_TS}" = "true" ]; then
   fi
 fi
 
+# ─── Observability: Timesketch audit tailer ──────────────────────────────────
+# Deploys the ts-audit-tailer sidecar that polls TS Postgres and emits
+# AUDIT-prefixed JSON to stdout (Promtail catches it via Docker SD).
+# Gated the same as Promtail (prod + LOKI_URL) AND requires TS to have
+# been installed and ts-config to have succeeded — otherwise the
+# `timesketch_default` network doesn't exist and there's nothing to tail.
+TS_AUDIT_STATUS="skipped"
+if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${LOKI_URL:-}" ] \
+   && [ "${INSTALL_TS}" = "true" ] && [ "${TS_CONFIG_FAILED:-}" != "true" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════"
+  echo "Deploying ts-audit-tailer (TS DB → Loki sidecar)"
+  echo "═══════════════════════════════════════════════════"
+
+  # Source case metadata (same as Promtail step below).
+  if [ -f /etc/vote-case.env ]; then
+    # shellcheck disable=SC1091
+    source /etc/vote-case.env
+  fi
+
+  if [ -z "${CASE_ID:-}" ]; then
+    echo "  WARN: CASE_ID not set — skipping ts-audit-tailer"
+    TS_AUDIT_STATUS="skipped (no CASE_ID)"
+  else
+    # Pull the TS Postgres password straight out of the running container
+    # (deploy_timesketch.sh writes it into the container's environment).
+    TS_DB_PASS=$(docker inspect postgres --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                  | grep '^POSTGRES_PASSWORD=' | cut -d= -f2-)
+    if [ -z "${TS_DB_PASS}" ]; then
+      echo "  WARN: could not read POSTGRES_PASSWORD from 'postgres' container — skipping"
+      TS_AUDIT_STATUS="skipped (no DB_PASS)"
+    else
+      TAILER_DIR="/opt/ts-audit-tailer"
+      mkdir -p "${TAILER_DIR}/state"
+      cp -r "${SCRIPT_DIR}/ts-audit-tailer/." "${TAILER_DIR}/"
+      # Write the tailer's env file (secrets stay off the command line
+      # and out of docker inspect for the main environment).
+      umask 077
+      cat > "${TAILER_DIR}/.env" <<EOF
+DB_PASS=${TS_DB_PASS}
+CASE_ID=${CASE_ID}
+EOF
+      umask 022
+
+      (
+        cd "${TAILER_DIR}"
+        # Build the sidecar image locally (tiny — python:3.12-slim +
+        # psycopg2-binary). `docker compose build` is idempotent.
+        docker compose build
+        docker compose up -d
+      )
+
+      # Quick smoke check: container up within 30s? A DB-unreachable
+      # tailer is still "running" — failure mode is stderr spam, not
+      # container exit. So we only verify presence, not log contents.
+      for i in $(seq 1 15); do
+        if docker ps --filter name=ts-audit-tailer --filter status=running -q | grep -q .; then
+          echo "  ts-audit-tailer: running (case=${CASE_ID})"
+          TS_AUDIT_STATUS="OK"
+          break
+        fi
+        if [ "$i" -eq 15 ]; then
+          echo "  WARN: ts-audit-tailer did not enter running state within 30s"
+          docker logs --tail 20 ts-audit-tailer 2>&1 | sed 's/^/    /'
+          TS_AUDIT_STATUS="FAILED"
+        fi
+        sleep 2
+      done
+    fi
+  fi
+elif [ "${ENVIRONMENT}" != "prod" ]; then
+  TS_AUDIT_STATUS="skipped (dev)"
+elif [ -z "${LOKI_URL:-}" ]; then
+  TS_AUDIT_STATUS="skipped (no LOKI_URL)"
+elif [ "${INSTALL_TS}" != "true" ]; then
+  TS_AUDIT_STATUS="skipped (TS not installed)"
+elif [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
+  TS_AUDIT_STATUS="skipped (TS config failed)"
+fi
+
+# ─── Observability: Promtail log shipper ─────────────────────────────────────
+# Deploys Promtail inside the case container so every Docker container's
+# stdout ships to Loki on services-1 with case=<CASE_ID> labels. Gated
+# on ENVIRONMENT=prod AND LOKI_URL set — dev and air-gapped installs skip.
+# This is the plumbing-only tier: no app-specific parsing yet.
+PROMTAIL_FAILED=""
+PROMTAIL_STATUS="skipped"
+if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${LOKI_URL:-}" ]; then
+  echo ""
+  echo "═══════════════════════════════════════════════════"
+  echo "Deploying Promtail (log shipper → ${LOKI_URL})"
+  echo "═══════════════════════════════════════════════════"
+
+  # Case ID: prefer /etc/vote-case.env (vote-managed), fall back to
+  # CASE_ID already in env (manual deploys with CASE_ID= set).
+  if [ -f /etc/vote-case.env ]; then
+    # shellcheck disable=SC1091
+    source /etc/vote-case.env
+  fi
+  if [ -z "${CASE_ID:-}" ]; then
+    echo "  WARN: CASE_ID not set (no /etc/vote-case.env, no env override) — skipping Promtail"
+    PROMTAIL_STATUS="skipped (no CASE_ID)"
+  else
+    # No wrapping block/tee — install.sh already sets a top-level
+    # `exec > >(tee -a "${MASTER_LOG}") 2>&1` (line ~260), so every
+    # echo here lands in /opt/openrelik-pipeline/logs/install.log
+    # automatically. Piping this block to a separate `tee` forked a
+    # subshell, and the PROMTAIL_STATUS assignments inside never
+    # propagated to the parent — which is why successful deploys
+    # showed "skipped" in the summary line.
+    PROMTAIL_DIR="/opt/promtail"
+    mkdir -p "${PROMTAIL_DIR}/positions"
+    cp "${SCRIPT_DIR}/promtail/docker-compose.yml" "${PROMTAIL_DIR}/docker-compose.yml"
+    # Substitute placeholders. Using # as sed delim so Loki URL's slashes don't conflict.
+    sed -e "s#__LOKI_URL__#${LOKI_URL}#g" \
+        -e "s#__CASE_ID__#${CASE_ID}#g" \
+        "${SCRIPT_DIR}/promtail/promtail-config.yaml" \
+        > "${PROMTAIL_DIR}/promtail-config.yaml"
+
+    cd "${PROMTAIL_DIR}"
+    docker compose pull
+    docker compose up -d
+    # Compose up -d doesn't recreate on mounted-file changes, and
+    # Promtail doesn't hot-reload — force restart so the new config
+    # is always loaded on re-run.
+    docker compose restart promtail
+
+    # Wait for /ready (bound to localhost by compose); fall back to
+    # showing compose logs on failure so the operator has context.
+    for i in $(seq 1 15); do
+      if curl -sf --max-time 2 http://127.0.0.1:9080/ready >/dev/null 2>&1; then
+        echo "  Promtail: ready (case=${CASE_ID})"
+        PROMTAIL_STATUS="OK"
+        break
+      fi
+      if [ "$i" -eq 15 ]; then
+        echo "  WARN: Promtail did not become ready within 30s"
+        docker compose logs --tail 30 promtail 2>&1 | sed 's/^/    /'
+        PROMTAIL_FAILED="true"
+        PROMTAIL_STATUS="FAILED"
+      fi
+      sleep 2
+    done
+  fi
+elif [ "${ENVIRONMENT}" != "prod" ]; then
+  echo ""
+  echo "Promtail: skipped (ENVIRONMENT=${ENVIRONMENT}, not prod)"
+  PROMTAIL_STATUS="skipped (dev)"
+elif [ -z "${LOKI_URL:-}" ]; then
+  echo ""
+  echo "Promtail: skipped (LOKI_URL not set in config.env)"
+  PROMTAIL_STATUS="skipped (no LOKI_URL)"
+fi
+
 echo "═══════════════════════════════════════════════════"
 echo "Install complete"
 
@@ -1051,6 +1300,9 @@ if [ "${INSTALL_VR}" = "true" ]; then
 else
   echo "  Velociraptor: skipped"
 fi
+
+echo "  Promtail:     ${PROMTAIL_STATUS}"
+echo "  TS Audit:     ${TS_AUDIT_STATUS}"
 
 # Clean up sensitive files — always remove vault credentials
 rm -f /etc/azure.cfg 2>/dev/null

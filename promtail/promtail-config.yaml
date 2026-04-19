@@ -1,0 +1,273 @@
+# Promtail config for a case container.
+# __LOKI_URL__ and __CASE_ID__ are substituted by install.sh at deploy time.
+#
+# Every Docker container on this LXC gets auto-discovered and its
+# stdout shipped to Loki with:
+#   source=case-container  class=ops
+#   case=<CASE_ID>  host=case-<CASE_ID>
+#   container=<docker-name>  compose_project=<...>  compose_service=<...>
+#
+# Audit-class parsing (source-specific) is added in follow-up PRs.
+
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+  log_level: info
+
+positions:
+  filename: /positions/positions.yaml
+
+clients:
+  - url: __LOKI_URL__/loki/api/v1/push
+    batchwait: 1s
+    batchsize: 1048576
+    backoff_config:
+      min_period: 500ms
+      max_period: 5m
+      max_retries: 10
+
+scrape_configs:
+  # All Docker containers on the case LXC
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+    relabel_configs:
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_project']
+        target_label: 'compose_project'
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'compose_service'
+      - target_label: 'job'
+        replacement: 'docker'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'case-container'
+      - target_label: 'class'
+        replacement: 'ops'
+
+  # Velociraptor audit log — chain-of-custody for VR operations.
+  # VR writes JSON-per-line to /opt/vr_data/logs/VelociraptorAudit_{info,error}.log
+  # inside the container (= /opt/velociraptor/vr_data/logs/ on the host,
+  # bind-mounted by the compose file).
+  # Fields seen in practice:
+  #   time         — RFC3339 timestamp
+  #   principal    — VR username who performed the action
+  #   operation    — e.g. CreateHunt, SetServerMonitoringState, client ops
+  #   msg          — usually mirrors operation
+  #   level        — info | error (also distinguishable via the filename)
+  #   details      — operation-specific nested object (stays in log body)
+  #
+  # __path__ uses the bare `.log` glob so rotated archives
+  # (VelociraptorAudit_info.log.202604130000) are NOT re-ingested.
+  - job_name: velociraptor-audit
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: velociraptor-audit
+          case: __CASE_ID__
+          host: case-__CASE_ID__
+          source: velociraptor
+          class: audit
+          __path__: /opt/velociraptor/vr_data/logs/VelociraptorAudit_*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: time
+            principal: principal
+            operation: operation
+            level: level
+      # Derive verdict from filename: *_info.log → ok, *_error.log → error
+      - regex:
+          expression: 'VelociraptorAudit_(?P<verdict_from_file>info|error)\.log$'
+          source: filename
+      # Prefer the file-based verdict; fall back to level if missing.
+      - template:
+          source: verdict_final
+          template: '{{ or .verdict_from_file .level "ok" }}'
+      # Normalize "info" → "ok" to match the unified schema's verdict set.
+      - template:
+          source: verdict_final
+          template: '{{ if eq .verdict_final "info" }}ok{{ else }}{{ .verdict_final }}{{ end }}'
+      # Use the event's own timestamp so backlogged lines land on the
+      # right Grafana timeline, not Promtail ingest time.
+      - timestamp:
+          source: ts
+          format: RFC3339
+      # Promote to unified-schema labels. `source`, `class`, `case`, `host`
+      # are already set statically above.
+      - labels:
+          actor: principal
+          action: operation
+          verdict: verdict_final
+
+  # OpenRelik audit events (v1 — HTTP-derived).
+  # openrelik-server emits only uvicorn access logs to stdout — no
+  # structured audit feed, no authenticated-user info. This scrape
+  # parses the access-log format, filters to meaningful write ops, and
+  # promotes them to the unified schema:
+  #
+  #   INFO:     1.2.3.4:5678 - "POST /api/v1/workflows/ HTTP/1.1" 201 Created
+  #                            ^method  ^path                     ^status
+  #
+  # Gaps acknowledged here (design doc § 6):
+  #   - `actor` is empty — uvicorn doesn't log the authenticated user.
+  #     Either upstream OR adds a middleware that emits structured
+  #     per-request audit events, or we sidecar a proxy-layer enricher.
+  #     For v1 we land the rest of the fields and accept that gap.
+  #   - Client IP is the internal Docker bridge address (nginx proxy
+  #     sits between Cloudflare and OR inside the case container), so
+  #     it isn't useful as audit context.
+  - job_name: openrelik-audit
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: name
+            values: [openrelik-server]
+    relabel_configs:
+      - target_label: 'job'
+        replacement: 'openrelik-audit'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'openrelik'
+      - target_label: 'class'
+        replacement: 'audit'
+    pipeline_stages:
+      # 1. Parse uvicorn access-log lines. Non-matching lines (startup
+      #    banner, celery connect messages, etc.) leave method/path/status
+      #    unset and get dropped below.
+      - regex:
+          expression: '^INFO:\s+(?P<client>[\d.]+(?::\d+)?)\s+-\s+"(?P<method>[A-Z]+)\s+(?P<path>[^"\s]+)\s+HTTP/[0-9.]+"\s+(?P<status>\d{3})'
+      # 2. Force `method` to a defined (possibly empty) string so the
+      #    drop stage can see it even when the regex above didn't match.
+      - template:
+          source: method
+          template: '{{ default "" .method }}'
+      - drop:
+          source: method
+          expression: '^$'
+          drop_counter_reason: non_access_log
+      # 3. Drop noise: health probes, internal polling, read-only GETs
+      #    that aren't downloads/exports.
+      - drop:
+          source: path
+          expression: '^(/healthz|/api/v1/taskqueue/|/api/v1/workflows/templates/|/api/v1/users/me)'
+          drop_counter_reason: healthz_or_polling
+      # 3a. Drop all GETs except those that look like downloads/exports
+      #     (the only read operations we consider audit-worthy).
+      - regex:
+          expression: '(?P<is_download>/(download|export)(?:\b|/))'
+          source: path
+      - template:
+          source: keep_line
+          template: '{{ if or (ne .method "GET") .is_download }}keep{{ end }}'
+      - drop:
+          source: keep_line
+          expression: '^$'
+          drop_counter_reason: readonly_get
+      # 4. Derive action from method+path. Unclassified audit-class
+      #    writes fall back to "api_<method>" so they still land with
+      #    something useful instead of being dropped.
+      - template:
+          source: action_derived
+          template: |
+            {{- $m := .method -}}
+            {{- $p := .path -}}
+            {{- if eq $p "/auth/local" -}}login
+            {{- else if regexMatch "/workflows/[0-9]+/run" $p -}}workflow_run
+            {{- else if and (eq $m "POST") (regexMatch "/workflows/?$" $p) -}}workflow_create
+            {{- else if and (eq $m "DELETE") (regexMatch "/workflows/" $p) -}}workflow_delete
+            {{- else if and (eq $m "POST") (regexMatch "/folders/[0-9]+/files/?$" $p) -}}file_upload
+            {{- else if regexMatch "/(download|export)(?:\b|/)" $p -}}file_download
+            {{- else if and (eq $m "DELETE") (regexMatch "/files/" $p) -}}file_delete
+            {{- else if and (eq $m "POST") (regexMatch "/folders/" $p) -}}folder_create
+            {{- else if and (eq $m "DELETE") (regexMatch "/folders/" $p) -}}folder_delete
+            {{- else -}}api_{{ $m | lower }}
+            {{- end -}}
+      # 5. Derive verdict from status code: 2xx=ok, 4xx=denied, 5xx=error.
+      - template:
+          source: verdict_derived
+          template: |
+            {{- if hasPrefix "2" .status -}}ok
+            {{- else if hasPrefix "4" .status -}}denied
+            {{- else if hasPrefix "5" .status -}}error
+            {{- else -}}{{ .status }}
+            {{- end -}}
+      # 6. Promote to unified-schema labels. No `actor` yet (see notes
+      #    at the top of this scrape — upstream OR gap).
+      - labels:
+          action: action_derived
+          verdict: verdict_derived
+
+  # Timesketch audit events — emitted by the ts-audit-tailer sidecar.
+  # TS has no structured audit feed; the sidecar polls the Postgres
+  # `searchhistory` and `analysissession` tables and prints lines of
+  # the form:
+  #
+  #   AUDIT {"ts":"…","event":"sketch_search","actor":"…",
+  #          "sketch_id":5,"sketch_name":"…","query":"…","result_count":42}
+  #
+  # Non-AUDIT lines from the sidecar (startup message, psycopg
+  # reconnect warnings) are dropped at ingest — they'd be ops-class,
+  # not audit.
+  - job_name: timesketch-audit
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: name
+            values: [ts-audit-tailer]
+    relabel_configs:
+      - target_label: 'job'
+        replacement: 'timesketch-audit'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'timesketch'
+      - target_label: 'class'
+        replacement: 'audit'
+    pipeline_stages:
+      # Keep only AUDIT-prefixed lines; drop the rest so the sidecar's
+      # own ops logging doesn't pollute audit queries.
+      - regex:
+          expression: '^AUDIT (?P<audit_json>\{.*\})\s*$'
+      - template:
+          source: audit_json
+          template: '{{ default "" .audit_json }}'
+      - drop:
+          source: audit_json
+          expression: '^$'
+          drop_counter_reason: non_audit_line
+      - json:
+          source: audit_json
+          expressions:
+            ts: ts
+            event: event
+            actor: actor
+      # sketch_id/query/result_count stay in the log body as JSON —
+      # sketch_id cardinality would blow up the label count. Query-time
+      # filtering with `| json | sketch_id="5"` still works.
+      - timestamp:
+          source: ts
+          format: RFC3339
+      # verdict is always ok — a row in the DB means the action
+      # succeeded. TS doesn't record failed searches this way.
+      - template:
+          source: verdict_static
+          template: 'ok'
+      - labels:
+          actor:
+          action: event
+          verdict: verdict_static
