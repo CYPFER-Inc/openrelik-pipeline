@@ -144,6 +144,19 @@ rewrite_compose_images() {
   done
 }
 
+pin_compose_image_digest() {
+  # Rewrite `image: .../<name>:<tag>` → `image: .../<name>@<digest>` for one image.
+  # Runs after rewrite_compose_images, so it matches both upstream and mirrored prefixes.
+  # Upstream openrelik-deploy pins by version tag (e.g. 0.7.0); we pin by digest so
+  # fresh case launches get an identical, vetted image — including one that carries
+  # main-branch code (auth/oidc.py) before an upstream release bakes it in.
+  local compose_file="$1"
+  local name="$2"
+  local digest="$3"
+  [ -z "${digest:-}" ] && return
+  sed -i -E "s|(^[[:space:]]*image:[[:space:]]*[^[:space:]]*/)${name}:[^[:space:]@]+|\1${name}@${digest}|g" "$compose_file"
+}
+
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -507,6 +520,17 @@ if [ "${INSTALL_OR}" = "true" ]; then
   # Rewrite OpenRelik docker-compose to use local mirror
   rewrite_compose_images /opt/openrelik/docker-compose.yml
 
+  # Pin OpenRelik core images by SHA256 digest from config.env. Needed because
+  # upstream openrelik-deploy templates pin to a version tag (0.7.0) that
+  # predates the generic OIDC auth module (src/auth/oidc.py, on main only).
+  # Digests are refreshed via scripts/update-digests.sh.
+  OR_COMPOSE="/opt/openrelik/docker-compose.yml"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-server"        "${OPENRELIK_SERVER_DIGEST}"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-ui"            "${OPENRELIK_UI_DIGEST}"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-mediator"      "${OPENRELIK_MEDIATOR_DIGEST}"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-worker-plaso"  "${OPENRELIK_WORKER_PLASO_DIGEST}"
+  echo "OpenRelik compose pinned to SHA256 digests from config.env"
+
   sed -i 's/127\.0\.0\.1/0\.0\.0\.0/g' /opt/openrelik/docker-compose.yml
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config.env
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config/settings.toml
@@ -539,6 +563,53 @@ if [ "${INSTALL_OR}" = "true" ]; then
       sed -i "s|allowed_origins = .*|allowed_origins = [\"${OR_URL}\"]|" /opt/openrelik/config/settings.toml
 
       echo "OpenRelik URLs set to ${OR_URL}"
+
+      # ─── OpenRelik OIDC (prod only) ────────────────────────────────────────
+      # When AUTHENTIK_OR_CLIENT_ID is set, configure the openrelik-server's
+      # generic OIDC module (src/auth/oidc.py, main-branch; needs digest-pinned
+      # image). One Authentik application (slug: openrelik) with per-case
+      # redirect URIs — moving to per-case Authentik applications is Phase 4.
+      #
+      # OR_BOOTSTRAP_USERS seeds the allowlist. New users auto-create on first
+      # successful OIDC login (no pre-creation required, unlike VR).
+      if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_OR_CLIENT_ID:-}" ]; then
+        AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
+        OR_SETTINGS="/opt/openrelik/config/settings.toml"
+        OR_COMPOSE="/opt/openrelik/docker-compose.yml"
+
+        echo "Configuring OpenRelik OIDC..."
+        echo "  Authentik: ${AUTHENTIK_BASE_URL}"
+        echo "  Client ID: ${AUTHENTIK_OR_CLIENT_ID}"
+
+        # Build TOML allowlist array from comma-separated OR_BOOTSTRAP_USERS
+        OR_ALLOWLIST_TOML=""
+        if [ -n "${OR_BOOTSTRAP_USERS:-}" ]; then
+          IFS=',' read -ra OR_EMAILS <<< "${OR_BOOTSTRAP_USERS}"
+          for e in "${OR_EMAILS[@]}"; do
+            e="$(echo "$e" | xargs)"
+            [ -z "$e" ] && continue
+            OR_ALLOWLIST_TOML+="\"${e}\", "
+          done
+          OR_ALLOWLIST_TOML="${OR_ALLOWLIST_TOML%, }"
+        fi
+
+        cat >> "${OR_SETTINGS}" <<EOF
+
+[auth.oidc]
+client_id = "${AUTHENTIK_OR_CLIENT_ID}"
+client_secret = "${AUTHENTIK_OR_CLIENT_SECRET}"
+discovery_url = "${AUTHENTIK_BASE_URL}/application/o/openrelik/.well-known/openid-configuration"
+allowlist = [${OR_ALLOWLIST_TOML}]
+redirect_uri = "${OR_URL}/auth/oidc"
+EOF
+
+        # Tell the UI to render the OIDC login button alongside local.
+        sed -i -E 's|^([[:space:]]*- OPENRELIK_AUTH_METHODS=).*$|\1local,oidc|' "${OR_COMPOSE}"
+
+        echo "OpenRelik OIDC configured (redirect: ${OR_URL}/auth/oidc)"
+      elif [ "${ENVIRONMENT}" = "prod" ]; then
+        echo "AUTHENTIK_OR_CLIENT_ID not set — OpenRelik using local auth only"
+      fi
 
       # Restart to apply
       cd /opt/openrelik
