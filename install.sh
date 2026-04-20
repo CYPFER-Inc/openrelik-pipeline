@@ -574,12 +574,17 @@ if [ "${INSTALL_OR}" = "true" ]; then
       # successful OIDC login (no pre-creation required, unlike VR).
       if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_OR_CLIENT_ID:-}" ]; then
         AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
+        # nginx-server's vRack IP — we force auth.dev.cypfer.io to resolve here
+        # so the server-side discovery fetch bypasses Cloudflare (which 403s
+        # non-browser User-Agents with error 1010).
+        AUTHENTIK_VRACK_HOST_IP="${AUTHENTIK_VRACK_HOST_IP:-51.222.196.105}"
         OR_SETTINGS="/opt/openrelik/config/settings.toml"
         OR_COMPOSE="/opt/openrelik/docker-compose.yml"
 
         echo "Configuring OpenRelik OIDC..."
         echo "  Authentik: ${AUTHENTIK_BASE_URL}"
         echo "  Client ID: ${AUTHENTIK_OR_CLIENT_ID}"
+        echo "  vRack host override: ${AUTHENTIK_VRACK_HOST_IP}"
 
         # Build TOML allowlist array from comma-separated OR_BOOTSTRAP_USERS
         OR_ALLOWLIST_TOML=""
@@ -605,6 +610,43 @@ EOF
 
         # Tell the UI to render the OIDC login button alongside local.
         sed -i -E 's|^([[:space:]]*- OPENRELIK_AUTH_METHODS=).*$|\1local,oidc|' "${OR_COMPOSE}"
+
+        # ─── vRack bypass + CF Origin CA trust ───────────────────────────────
+        # openrelik-server must reach Authentik server-side for OIDC discovery
+        # and token exchange. Going through Cloudflare fails — CF blocks Python
+        # httpx with error 1010 (banned browser signature). Route the hostname
+        # directly to nginx-server on the vRack, which terminates TLS with a
+        # Cloudflare Origin CA cert — add CF's Origin roots to the container's
+        # trust store so certificate validation succeeds.
+        OR_CA_DIR="/opt/openrelik/cf-origin-ca"
+        OR_CA_BUNDLE="${OR_CA_DIR}/ca-bundle.crt"
+        if [ ! -f "${OR_CA_BUNDLE}" ]; then
+          mkdir -p "${OR_CA_DIR}"
+          echo "Fetching Cloudflare Origin CA roots..."
+          curl -sSL -o "${OR_CA_DIR}/origin_ca_rsa_root.pem" \
+            https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem
+          curl -sSL -o "${OR_CA_DIR}/origin_ca_ecc_root.pem" \
+            https://developers.cloudflare.com/ssl/static/origin_ca_ecc_root.pem
+          # Concat the system bundle with CF's two roots so SSL_CERT_FILE covers both.
+          cat /etc/ssl/certs/ca-certificates.crt \
+              "${OR_CA_DIR}/origin_ca_rsa_root.pem" \
+              "${OR_CA_DIR}/origin_ca_ecc_root.pem" > "${OR_CA_BUNDLE}"
+          echo "CA bundle built: $(wc -l <"${OR_CA_BUNDLE}") lines"
+        fi
+
+        # Derive the Authentik hostname from AUTHENTIK_BASE_URL for the /etc/hosts override.
+        AUTHENTIK_HOST="$(echo "${AUTHENTIK_BASE_URL}" | sed -E 's|^https?://([^/]+).*|\1|')"
+
+        # Patch openrelik-server in docker-compose.yml: extra_hosts + CA env + CA volume.
+        # Insertion anchors are unique within the openrelik-server service block.
+        grep -q "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" "${OR_COMPOSE}" || \
+          sed -i "/- PROMETHEUS_SERVER_URL=/a\\      - SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt\\n      - REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt" "${OR_COMPOSE}"
+
+        grep -q "cf-origin-ca/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt" "${OR_COMPOSE}" || \
+          sed -i "/- \.\/config:\/etc\/openrelik\/:z/a\\      - ./cf-origin-ca/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt:ro" "${OR_COMPOSE}"
+
+        grep -q "extra_hosts:" "${OR_COMPOSE}" || \
+          sed -i "/^  openrelik-server:/a\\    extra_hosts:\\n      - \"${AUTHENTIK_HOST}:${AUTHENTIK_VRACK_HOST_IP}\"" "${OR_COMPOSE}"
 
         echo "OpenRelik OIDC configured (redirect: ${OR_URL}/auth/oidc)"
       elif [ "${ENVIRONMENT}" = "prod" ]; then
