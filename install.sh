@@ -466,9 +466,14 @@ EOF
     # "Local authentication is disabled for this user. Please use OAuth."
     sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin']|" "$TS_CONF"
 
-    # Restart Timesketch to pick up OIDC config
+    # Restart Timesketch to pick up OIDC config. Also bounce nginx: it caches
+    # the upstream container IP at startup, and when timesketch-web comes back
+    # on a new IP (docker reassigns on restart) nginx keeps sending traffic to
+    # whatever container now sits at the old IP — typically timesketch-worker,
+    # which doesn't serve HTTP, hence 502 Bad Gateway. Observed on case-1336.
     cd /opt/timesketch
     docker compose restart timesketch-web
+    docker compose restart nginx
     cd /opt
 
     echo "Timesketch OIDC configured"
