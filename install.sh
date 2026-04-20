@@ -96,40 +96,52 @@ retry_pull() {
 
 mirror_image() {
   # Rewrite an image reference to use the local registry mirror if configured.
-  # Usage: mirror_image "ghcr.io/openrelik/openrelik-server:0.7.0"
-  # Returns: "51.222.196.105:5000/openrelik/openrelik-server:0.7.0" (if mirrored)
-  #      or: "ghcr.io/openrelik/openrelik-server:0.7.0" (if no mirror)
+  # Three cases:
+  #   1. Explicit registry (first segment contains '.' or ':'):
+  #        ghcr.io/cypfer-inc/x:latest    → MIRROR/cypfer-inc/x:latest
+  #        us-docker.pkg.dev/a/b/c:v1     → MIRROR/a/b/c:v1
+  #   2. Bare image (no slash): Docker Hub library
+  #        redis:8     → MIRROR/library/redis:8
+  #        nginx:alpine → MIRROR/library/nginx:alpine
+  #   3. Docker Hub org/name (has slash, first segment is NOT a registry):
+  #        opensearchproject/opensearch → MIRROR/opensearchproject/opensearch
+  #        prom/prometheus:v3           → MIRROR/prom/prometheus:v3
   local image="$1"
-  if [ -n "${REGISTRY_MIRROR:-}" ]; then
-    # Strip the registry prefix (ghcr.io/, docker.io/library/, docker.io/, etc.)
-    local path="${image#*/}"
-    # Handle bare images (e.g. redis:8, ubuntu:22.04) — add library/ prefix
-    if [[ "$image" != */* ]]; then
-      path="library/${image}"
-    fi
-    echo "${REGISTRY_MIRROR}/${path}"
-  else
+  if [ -z "${REGISTRY_MIRROR:-}" ]; then
     echo "$image"
+    return
+  fi
+  if [[ "$image" != */* ]]; then
+    echo "${REGISTRY_MIRROR}/library/${image}"
+    return
+  fi
+  local first="${image%%/*}"
+  if [[ "$first" == *.* ]] || [[ "$first" == *:* ]]; then
+    echo "${REGISTRY_MIRROR}/${image#*/}"
+  else
+    echo "${REGISTRY_MIRROR}/${image}"
   fi
 }
 
 rewrite_compose_images() {
-  # Rewrite all image references in a docker-compose.yml to use the local mirror.
-  # Usage: rewrite_compose_images /opt/openrelik/docker-compose.yml
+  # Iterate every `image: X` line in the compose file and rewrite X via
+  # mirror_image(). Replaces the old prefix-enumeration approach, which
+  # missed us-docker.pkg.dev/, bare nginx:, opensearchproject/, etc.
   local compose_file="$1"
   if [ -z "${REGISTRY_MIRROR:-}" ]; then
     return
   fi
   echo "Rewriting image references to use local registry: ${REGISTRY_MIRROR}"
-  # Rewrite all ghcr.io/ references — cypfer-inc images are now mirrored too
-  # (they're the biggest in the stack and were the #1 source of MTU/TLS failures).
-  sed -i "s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
-  # Rewrite docker.io/ references (explicit)
-  sed -i "s|image: docker.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
-  # Rewrite bare images (redis:8, postgres:17, etc.) — add library/ prefix
-  sed -i -E "s|image: (redis\|postgres\|ubuntu):|image: ${REGISTRY_MIRROR}/library/\1:|g" "$compose_file" 2>/dev/null
-  # Rewrite prom/prometheus (not under library/)
-  sed -i "s|image: prom/|image: ${REGISTRY_MIRROR}/prom/|g" "$compose_file"
+  local img mirrored esc_orig esc_new
+  mapfile -t IMAGES < <(grep -oE '^[[:space:]]*image:[[:space:]]*[^[:space:]#]+' "$compose_file" | awk '{print $2}' | sort -u)
+  for img in "${IMAGES[@]}"; do
+    mirrored=$(mirror_image "$img")
+    [ "$img" = "$mirrored" ] && continue
+    esc_orig=$(printf '%s' "$img" | sed 's/[\/&|]/\\&/g')
+    esc_new=$(printf '%s' "$mirrored" | sed 's/[\/&|]/\\&/g')
+    # Anchor on "image:" so we don't accidentally rewrite the same string elsewhere
+    sed -i -E "s|(^[[:space:]]*image:[[:space:]]*)${esc_orig}([[:space:]]*$)|\1${esc_new}\2|g" "$compose_file"
+  done
 }
 
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
@@ -189,6 +201,11 @@ fi
 set -a
 source "${CONFIG_FILE}"
 set +a
+
+# Default local registry mirror — nginx-server on the vRack. vault config.env
+# can override. Everything below this line can reference ${REGISTRY_MIRROR}
+# knowing it's set in prod (dev-mode override still empties it later).
+REGISTRY_MIRROR="${REGISTRY_MIRROR:-51.222.196.105:5000}"
 
 echo "config.env loaded successfully"
 
