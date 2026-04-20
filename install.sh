@@ -842,6 +842,7 @@ if [ "${INSTALL_VR}" = "true" ]; then
     environment:
       - VELOCIRAPTOR_PASSWORD=${VELOCIRAPTOR_PASSWORD}
       - IP_ADDRESS=${IP_ADDRESS}
+      - VR_BOOTSTRAP_USERS=${VR_BOOTSTRAP_USERS:-}
     ports:
       - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
@@ -943,6 +944,28 @@ PYEOF
   fi
 
   ./velociraptor --config /opt/server.config.yaml user add admin "$VELOCIRAPTOR_PASSWORD" --role administrator
+
+  # Bootstrap OIDC users — pre-create them before VR starts so the first login
+  # from Authentik doesn't hit "User <email> is not registered on this system".
+  # Adding users while VR is running populates the datastore but VR's in-memory
+  # user cache only reloads on restart; doing it here (before the exec below)
+  # avoids the restart dance.
+  #
+  # VR_BOOTSTRAP_USERS is a comma-separated list of emails — values come from
+  # config.env (pulled from Azure KV in prod). All are added as administrator.
+  # See pre-populate-users TODO in microcloud/TODO.md for the proper per-case
+  # grant workflow that will supersede this.
+  if [ -n "\${VR_BOOTSTRAP_USERS:-}" ]; then
+    echo "Pre-creating VR OIDC users: \${VR_BOOTSTRAP_USERS}"
+    IFS=',' read -ra _USERS <<< "\${VR_BOOTSTRAP_USERS}"
+    for u in "\${_USERS[@]}"; do
+      u="\$(echo "\$u" | xargs)"
+      [ -z "\$u" ] && continue
+      ./velociraptor --config /opt/server.config.yaml user add "\$u" --role administrator 2>/dev/null \\
+        && echo "  + \$u" \\
+        || echo "  ! failed: \$u"
+    done
+  fi
 fi
 
 exec /opt/velociraptor --config /opt/server.config.yaml frontend -v
