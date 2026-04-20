@@ -121,8 +121,9 @@ rewrite_compose_images() {
     return
   fi
   echo "Rewriting image references to use local registry: ${REGISTRY_MIRROR}"
-  # Rewrite ghcr.io/ references — but skip CYPFER images (small, change often, pull direct)
-  sed -i "/cypfer-inc/!s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
+  # Rewrite all ghcr.io/ references — cypfer-inc images are now mirrored too
+  # (they're the biggest in the stack and were the #1 source of MTU/TLS failures).
+  sed -i "s|image: ghcr.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
   # Rewrite docker.io/ references (explicit)
   sed -i "s|image: docker.io/|image: ${REGISTRY_MIRROR}/|g" "$compose_file"
   # Rewrite bare images (redis:8, postgres:17, etc.) — add library/ prefix
@@ -633,7 +634,7 @@ psort.py --version || true
   # Run OpenRelik post-install configuration (workers, workflows, folders)
   echo "Running OpenRelik post-install configuration..."
 
-  OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}"
+  OR_CONFIG_IMAGE="${OR_CONFIG_IMAGE:-$(mirror_image ghcr.io/cypfer-inc/openrelik-or-config:latest)}"
   OR_PULL_OK=false
   for i in 1 2 3 4 5; do
     if docker pull "${OR_CONFIG_IMAGE}" 2>&1 | tee /opt/openrelik-pipeline/logs/or-config-pull.log; then
@@ -974,7 +975,7 @@ EOF
         echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GHCR_USER}" --password-stdin 2>/dev/null
       fi
 
-      VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}
+      VR_CONFIG_IMAGE=${VR_CONFIG_IMAGE:-$(mirror_image ghcr.io/cypfer-inc/openrelik-vr-config:latest)}
       VR_PULL_OK=false
       for i in 1 2 3 4 5; do
         if docker pull "${VR_CONFIG_IMAGE}"; then
@@ -1030,7 +1031,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
   echo "═══════════════════════════════════════════════════"
   echo "Running Timesketch post-install configuration..."
 
-  TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}"
+  TS_CONFIG_IMAGE="${TS_CONFIG_IMAGE:-$(mirror_image ghcr.io/cypfer-inc/openrelik-ts-config:latest)}"
   TS_DEFAULT_SKETCH="${TS_DEFAULT_SKETCH:-true}"
 
   # Determine sketch name — vote uses case ID, dev uses "CYPFER Dev"
