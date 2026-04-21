@@ -734,9 +734,34 @@ psort.py --version || true
 
   docker compose restart openrelik-worker-plaso
 
-  OPENRELIK_API_KEY="$(docker compose exec openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
-  OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:space:]')
+  # Capture the API key with -T so docker compose does not allocate a TTY.
+  # With a TTY, typer/rich wrap the JWT at ~80 cols and emit ANSI escapes
+  # that survive `tr -d '[:space:]'` and corrupt the placeholder replacement.
+  # COLUMNS=1000 defends against the same wrapping if -T is ever dropped.
+  # Validate the captured value looks like a JWT (three base64url segments,
+  # >= 100 chars) before writing anything. If we let an empty value through,
+  # sed silently clears OPENRELIK_API_KEY in docker-compose.yml and the
+  # pipeline container boots with no credentials, producing confusing
+  # "API key has expired" errors on every POST from Velociraptor.
+  OPENRELIK_API_KEY="$(COLUMNS=1000 docker compose exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
+  OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:cntrl:][:space:]')
+  if [ "${#OPENRELIK_API_KEY}" -lt 100 ] || ! echo "$OPENRELIK_API_KEY" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+    echo "ERROR: captured OPENRELIK_API_KEY does not look like a JWT (len=${#OPENRELIK_API_KEY})"
+    echo "       admin.py create-api-key output (for diagnosis):"
+    COLUMNS=1000 docker compose exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer-debug" 2>&1 | head -20 || true
+    exit 1
+  fi
+
   sed -i "s#YOUR_API_KEY#$OPENRELIK_API_KEY#g" /opt/openrelik-pipeline/docker-compose.yml
+
+  # Materialize TIMESKETCH_PASSWORD into the compose file too. The template
+  # used to be `TIMESKETCH_PASSWORD=${TIMESKETCH_PASSWORD}`, which docker
+  # compose only resolves when the shell has the variable in its env. After
+  # install cleans up config.env, any later `docker compose up` resolves it
+  # to an empty string and the pipeline fails TS login with
+  # "Invalid username or password." Replace the placeholder with the literal
+  # value now, mirroring the YOUR_API_KEY pattern.
+  sed -i "s#YOUR_TS_PASSWORD#${TIMESKETCH_PASSWORD}#g" /opt/openrelik-pipeline/docker-compose.yml
 
   # Persist key to config.env and key file so configure container and rotation cron can use it
   if grep -q "^OPENRELIK_API_KEY=" /opt/openrelik-pipeline/config.env 2>/dev/null; then
