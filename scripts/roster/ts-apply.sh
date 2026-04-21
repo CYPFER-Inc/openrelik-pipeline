@@ -3,11 +3,11 @@
 # ts-apply.sh — reconcile Timesketch user state with a local roster file.
 #
 # Roster format (one entry per line, # for comments):
-#   email=role        # role ∈ {admin, analyst, reader}
+#   email=role        # role ∈ {admin, investigator, reader}
 #
 # CYPFER → TS role mapping (TS's user model is binary-admin like OR):
-#   admin            → tsctl make-admin
-#   analyst, reader  → tsctl revoke-admin
+#   admin                  → tsctl make-admin
+#   investigator, reader   → tsctl revoke-admin
 #
 # Invariants after a successful run:
 #   1. Every roster user exists in TS (pre-created with --password so OIDC
@@ -68,8 +68,8 @@ while IFS= read -r line; do
     role="$(echo "$role" | xargs)"
 
     case "$role" in
-        admin|analyst|reader) ;;
-        *) die "invalid role '$role' for $email (valid: admin, analyst, reader)" ;;
+        admin|investigator|reader) ;;
+        *) die "invalid role '$role' for $email (valid: admin, investigator, reader)" ;;
     esac
     EMAILS+=("$email")
     ROLES+=("$role")
