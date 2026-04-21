@@ -144,6 +144,19 @@ rewrite_compose_images() {
   done
 }
 
+pin_compose_image_digest() {
+  # Rewrite `image: .../<name>:<tag>` → `image: .../<name>@<digest>` for one image.
+  # Runs after rewrite_compose_images, so it matches both upstream and mirrored prefixes.
+  # Upstream openrelik-deploy pins by version tag (e.g. 0.7.0); we pin by digest so
+  # fresh case launches get an identical, vetted image — including one that carries
+  # main-branch code (auth/oidc.py) before an upstream release bakes it in.
+  local compose_file="$1"
+  local name="$2"
+  local digest="$3"
+  [ -z "${digest:-}" ] && return
+  sed -i -E "s|(^[[:space:]]*image:[[:space:]]*[^[:space:]]*/)${name}:[^[:space:]@]+|\1${name}@${digest}|g" "$compose_file"
+}
+
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -453,9 +466,14 @@ EOF
     # "Local authentication is disabled for this user. Please use OAuth."
     sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin']|" "$TS_CONF"
 
-    # Restart Timesketch to pick up OIDC config
+    # Restart Timesketch to pick up OIDC config. Also bounce nginx: it caches
+    # the upstream container IP at startup, and when timesketch-web comes back
+    # on a new IP (docker reassigns on restart) nginx keeps sending traffic to
+    # whatever container now sits at the old IP — typically timesketch-worker,
+    # which doesn't serve HTTP, hence 502 Bad Gateway. Observed on case-1336.
     cd /opt/timesketch
     docker compose restart timesketch-web
+    docker compose restart nginx
     cd /opt
 
     echo "Timesketch OIDC configured"
@@ -507,6 +525,17 @@ if [ "${INSTALL_OR}" = "true" ]; then
   # Rewrite OpenRelik docker-compose to use local mirror
   rewrite_compose_images /opt/openrelik/docker-compose.yml
 
+  # Pin OpenRelik core images by SHA256 digest from config.env. Needed because
+  # upstream openrelik-deploy templates pin to a version tag (0.7.0) that
+  # predates the generic OIDC auth module (src/auth/oidc.py, on main only).
+  # Digests are refreshed via scripts/update-digests.sh.
+  OR_COMPOSE="/opt/openrelik/docker-compose.yml"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-server"        "${OPENRELIK_SERVER_DIGEST}"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-ui"            "${OPENRELIK_UI_DIGEST}"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-mediator"      "${OPENRELIK_MEDIATOR_DIGEST}"
+  pin_compose_image_digest "${OR_COMPOSE}" "openrelik-worker-plaso"  "${OPENRELIK_WORKER_PLASO_DIGEST}"
+  echo "OpenRelik compose pinned to SHA256 digests from config.env"
+
   sed -i 's/127\.0\.0\.1/0\.0\.0\.0/g' /opt/openrelik/docker-compose.yml
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config.env
   sed -i "s/localhost/$IP_ADDRESS/g" /opt/openrelik/config/settings.toml
@@ -539,6 +568,95 @@ if [ "${INSTALL_OR}" = "true" ]; then
       sed -i "s|allowed_origins = .*|allowed_origins = [\"${OR_URL}\"]|" /opt/openrelik/config/settings.toml
 
       echo "OpenRelik URLs set to ${OR_URL}"
+
+      # ─── OpenRelik OIDC (prod only) ────────────────────────────────────────
+      # When AUTHENTIK_OR_CLIENT_ID is set, configure the openrelik-server's
+      # generic OIDC module (src/auth/oidc.py, main-branch; needs digest-pinned
+      # image). One Authentik application (slug: openrelik) with per-case
+      # redirect URIs — moving to per-case Authentik applications is Phase 4.
+      #
+      # OR_BOOTSTRAP_USERS seeds the allowlist. New users auto-create on first
+      # successful OIDC login (no pre-creation required, unlike VR).
+      if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_OR_CLIENT_ID:-}" ]; then
+        AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
+        # nginx-server's vRack IP — we force auth.dev.cypfer.io to resolve here
+        # so the server-side discovery fetch bypasses Cloudflare (which 403s
+        # non-browser User-Agents with error 1010).
+        AUTHENTIK_VRACK_HOST_IP="${AUTHENTIK_VRACK_HOST_IP:-51.222.196.105}"
+        OR_SETTINGS="/opt/openrelik/config/settings.toml"
+        OR_COMPOSE="/opt/openrelik/docker-compose.yml"
+
+        echo "Configuring OpenRelik OIDC..."
+        echo "  Authentik: ${AUTHENTIK_BASE_URL}"
+        echo "  Client ID: ${AUTHENTIK_OR_CLIENT_ID}"
+        echo "  vRack host override: ${AUTHENTIK_VRACK_HOST_IP}"
+
+        # Build TOML allowlist array from comma-separated OR_BOOTSTRAP_USERS
+        OR_ALLOWLIST_TOML=""
+        if [ -n "${OR_BOOTSTRAP_USERS:-}" ]; then
+          IFS=',' read -ra OR_EMAILS <<< "${OR_BOOTSTRAP_USERS}"
+          for e in "${OR_EMAILS[@]}"; do
+            e="$(echo "$e" | xargs)"
+            [ -z "$e" ] && continue
+            OR_ALLOWLIST_TOML+="\"${e}\", "
+          done
+          OR_ALLOWLIST_TOML="${OR_ALLOWLIST_TOML%, }"
+        fi
+
+        cat >> "${OR_SETTINGS}" <<EOF
+
+[auth.oidc]
+client_id = "${AUTHENTIK_OR_CLIENT_ID}"
+client_secret = "${AUTHENTIK_OR_CLIENT_SECRET}"
+discovery_url = "${AUTHENTIK_BASE_URL}/application/o/openrelik/.well-known/openid-configuration"
+allowlist = [${OR_ALLOWLIST_TOML}]
+redirect_uri = "${OR_URL}/auth/oidc"
+EOF
+
+        # Tell the UI to render the OIDC login button alongside local.
+        sed -i -E 's|^([[:space:]]*- OPENRELIK_AUTH_METHODS=).*$|\1local,oidc|' "${OR_COMPOSE}"
+
+        # ─── vRack bypass + CF Origin CA trust ───────────────────────────────
+        # openrelik-server must reach Authentik server-side for OIDC discovery
+        # and token exchange. Going through Cloudflare fails — CF blocks Python
+        # httpx with error 1010 (banned browser signature). Route the hostname
+        # directly to nginx-server on the vRack, which terminates TLS with a
+        # Cloudflare Origin CA cert — add CF's Origin roots to the container's
+        # trust store so certificate validation succeeds.
+        OR_CA_DIR="/opt/openrelik/cf-origin-ca"
+        OR_CA_BUNDLE="${OR_CA_DIR}/ca-bundle.crt"
+        if [ ! -f "${OR_CA_BUNDLE}" ]; then
+          mkdir -p "${OR_CA_DIR}"
+          echo "Fetching Cloudflare Origin CA roots..."
+          curl -sSL -o "${OR_CA_DIR}/origin_ca_rsa_root.pem" \
+            https://developers.cloudflare.com/ssl/static/origin_ca_rsa_root.pem
+          curl -sSL -o "${OR_CA_DIR}/origin_ca_ecc_root.pem" \
+            https://developers.cloudflare.com/ssl/static/origin_ca_ecc_root.pem
+          # Concat the system bundle with CF's two roots so SSL_CERT_FILE covers both.
+          cat /etc/ssl/certs/ca-certificates.crt \
+              "${OR_CA_DIR}/origin_ca_rsa_root.pem" \
+              "${OR_CA_DIR}/origin_ca_ecc_root.pem" > "${OR_CA_BUNDLE}"
+          echo "CA bundle built: $(wc -l <"${OR_CA_BUNDLE}") lines"
+        fi
+
+        # Derive the Authentik hostname from AUTHENTIK_BASE_URL for the /etc/hosts override.
+        AUTHENTIK_HOST="$(echo "${AUTHENTIK_BASE_URL}" | sed -E 's|^https?://([^/]+).*|\1|')"
+
+        # Patch openrelik-server in docker-compose.yml: extra_hosts + CA env + CA volume.
+        # Insertion anchors are unique within the openrelik-server service block.
+        grep -q "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" "${OR_COMPOSE}" || \
+          sed -i "/- PROMETHEUS_SERVER_URL=/a\\      - SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt\\n      - REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt" "${OR_COMPOSE}"
+
+        grep -q "cf-origin-ca/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt" "${OR_COMPOSE}" || \
+          sed -i "/- \.\/config:\/etc\/openrelik\/:z/a\\      - ./cf-origin-ca/ca-bundle.crt:/etc/ssl/certs/ca-bundle.crt:ro" "${OR_COMPOSE}"
+
+        grep -q "extra_hosts:" "${OR_COMPOSE}" || \
+          sed -i "/^  openrelik-server:/a\\    extra_hosts:\\n      - \"${AUTHENTIK_HOST}:${AUTHENTIK_VRACK_HOST_IP}\"" "${OR_COMPOSE}"
+
+        echo "OpenRelik OIDC configured (redirect: ${OR_URL}/auth/oidc)"
+      elif [ "${ENVIRONMENT}" = "prod" ]; then
+        echo "AUTHENTIK_OR_CLIENT_ID not set — OpenRelik using local auth only"
+      fi
 
       # Restart to apply
       cd /opt/openrelik
@@ -842,6 +960,7 @@ if [ "${INSTALL_VR}" = "true" ]; then
     environment:
       - VELOCIRAPTOR_PASSWORD=${VELOCIRAPTOR_PASSWORD}
       - IP_ADDRESS=${IP_ADDRESS}
+      - VR_BOOTSTRAP_USERS=${VR_BOOTSTRAP_USERS:-}
     ports:
       - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
@@ -943,6 +1062,28 @@ PYEOF
   fi
 
   ./velociraptor --config /opt/server.config.yaml user add admin "$VELOCIRAPTOR_PASSWORD" --role administrator
+
+  # Bootstrap OIDC users — pre-create them before VR starts so the first login
+  # from Authentik doesn't hit "User <email> is not registered on this system".
+  # Adding users while VR is running populates the datastore but VR's in-memory
+  # user cache only reloads on restart; doing it here (before the exec below)
+  # avoids the restart dance.
+  #
+  # VR_BOOTSTRAP_USERS is a comma-separated list of emails — values come from
+  # config.env (pulled from Azure KV in prod). All are added as administrator.
+  # See pre-populate-users TODO in microcloud/TODO.md for the proper per-case
+  # grant workflow that will supersede this.
+  if [ -n "\${VR_BOOTSTRAP_USERS:-}" ]; then
+    echo "Pre-creating VR OIDC users: \${VR_BOOTSTRAP_USERS}"
+    IFS=',' read -ra _USERS <<< "\${VR_BOOTSTRAP_USERS}"
+    for u in "\${_USERS[@]}"; do
+      u="\$(echo "\$u" | xargs)"
+      [ -z "\$u" ] && continue
+      ./velociraptor --config /opt/server.config.yaml user add "\$u" --role administrator 2>/dev/null \\
+        && echo "  + \$u" \\
+        || echo "  ! failed: \$u"
+    done
+  fi
 fi
 
 exec /opt/velociraptor --config /opt/server.config.yaml frontend -v
