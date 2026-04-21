@@ -3,12 +3,14 @@
 # vr-apply.sh — reconcile Velociraptor user state with a local roster file.
 #
 # Roster format (one entry per line, # for comments):
-#   email=role        # role ∈ {admin, analyst, reader}
+#   email=role        # role ∈ {admin, investigator, reader}
 #
 # CYPFER → VR role mapping:
-#   admin    → administrator
-#   analyst  → analyst
-#   reader   → reader
+#   admin         → administrator
+#   investigator  → investigator     (VR's native DFIR-operator role;
+#                                      can launch hunts, approve queries,
+#                                      collect artifacts)
+#   reader        → reader
 #
 # VR's CLI surface is thinner than OR's:
 #   * `user add --role <r> <username>` is idempotent — creates missing users,
@@ -57,9 +59,9 @@ docker ps --format '{{.Names}}' | grep -q '^velociraptor$' \
 
 cypfer_to_vr() {
     case "$1" in
-        admin)   printf 'administrator' ;;
-        analyst) printf 'analyst' ;;
-        reader)  printf 'reader' ;;
+        admin)        printf 'administrator' ;;
+        investigator) printf 'investigator' ;;
+        reader)       printf 'reader' ;;
         *) return 1 ;;
     esac
 }
@@ -91,7 +93,7 @@ while IFS= read -r line; do
     role="$(echo "$role" | xargs)"
 
     vr_role=$(cypfer_to_vr "$role") \
-        || die "invalid role '$role' for $email (valid: admin, analyst, reader)"
+        || die "invalid role '$role' for $email (valid: admin, investigator, reader)"
     vr_user_add "$email" "$vr_role"
     log "  $email: cypfer=$role vr=$vr_role"
     count=$((count + 1))

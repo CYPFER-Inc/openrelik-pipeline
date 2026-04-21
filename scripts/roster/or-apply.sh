@@ -3,11 +3,11 @@
 # or-apply.sh — reconcile OpenRelik user state with a local roster file.
 #
 # Roster format (one entry per line, # for comments):
-#   email=role        # role ∈ {admin, analyst, reader}
+#   email=role        # role ∈ {admin, investigator, reader}
 #
 # CYPFER → OR role mapping:
-#   admin            → OR admin flag ON
-#   analyst, reader  → OR admin flag OFF
+#   admin                  → OR admin flag ON
+#   investigator, reader   → OR admin flag OFF
 #
 # Invariants after a successful run:
 #   1. settings.toml [auth.oidc].allowlist contains exactly the roster emails.
@@ -56,8 +56,8 @@ while IFS= read -r line; do
     role="$(echo "$role" | xargs)"
 
     case "$role" in
-        admin|analyst|reader) ;;
-        *) die "invalid role '$role' for $email (valid: admin, analyst, reader)" ;;
+        admin|investigator|reader) ;;
+        *) die "invalid role '$role' for $email (valid: admin, investigator, reader)" ;;
     esac
 
     EMAILS+=("$email")
