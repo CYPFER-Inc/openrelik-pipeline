@@ -295,6 +295,32 @@ export IP_ADDRESS
 
 mkdir -p /opt/openrelik-pipeline/logs
 
+# ─── Structured install audit trail ───────────────────────────────────────────
+# Emits JSON lines to install.audit.log that case-promtail tails with
+# source=case-install, class=audit. Grafana alert rules fire on
+# install-start / install-error / install-complete events.
+INSTALL_AUDIT_LOG="/opt/openrelik-pipeline/logs/install.audit.log"
+
+emit_install_audit() {
+  # Usage: emit_install_audit <action> <verdict> [component]
+  # action: install-start | install-error | install-complete
+  # verdict: ok | error
+  local action="$1" verdict="$2" component="${3:-}"
+  local ts case_id
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  case_id="${CASE_ID:-unknown}"
+  # Never fail the install because audit emission failed.
+  if [ -n "$component" ]; then
+    printf '{"ts":"%s","source":"case-install","class":"audit","case":"%s","action":"%s","verdict":"%s","component":"%s"}\n' \
+      "$ts" "$case_id" "$action" "$verdict" "$component" \
+      >> "${INSTALL_AUDIT_LOG}" 2>/dev/null || true
+  else
+    printf '{"ts":"%s","source":"case-install","class":"audit","case":"%s","action":"%s","verdict":"%s"}\n' \
+      "$ts" "$case_id" "$action" "$verdict" \
+      >> "${INSTALL_AUDIT_LOG}" 2>/dev/null || true
+  fi
+}
+
 # ─── Environment validation ───────────────────────────────────────────────────
 ENVIRONMENT=${ENVIRONMENT:-dev}
 echo "Environment: ${ENVIRONMENT}"
@@ -305,6 +331,11 @@ mkdir -p /opt/openrelik-pipeline/logs
 MASTER_LOG="/opt/openrelik-pipeline/logs/install.log"
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Install starting — environment: ${ENVIRONMENT}" > "${MASTER_LOG}"
 exec > >(tee -a "${MASTER_LOG}") 2>&1
+
+# Fire the install-start audit event as soon as we have logging set up.
+# CASE_ID may still be empty on non-vote-managed dev installs — that's fine,
+# it falls back to "unknown" and alerts skip those.
+emit_install_audit install-start ok
 
 if [ "${ENVIRONMENT}" = "prod" ]; then
   # When vote-case.env exists, URLs are computed from CASE_ID/CASE_DOMAIN.
@@ -1577,10 +1608,15 @@ fi
 echo "═══════════════════════════════════════════════════"
 echo "Install complete"
 
+# Track overall verdict as we walk the summary; any component FAILED → error.
+INSTALL_OVERALL_VERDICT=ok
+
 # Show actual status — requested vs success
 if [ "${INSTALL_TS}" = "true" ]; then
   if [ "${TS_CONFIG_FAILED:-}" = "true" ]; then
     echo "  Timesketch:   FAILED — check /opt/openrelik-pipeline/logs/ts-config.log"
+    emit_install_audit install-error error timesketch
+    INSTALL_OVERALL_VERDICT=error
   else
     echo "  Timesketch:   OK"
   fi
@@ -1591,6 +1627,8 @@ fi
 if [ "${INSTALL_OR}" = "true" ]; then
   if [ "${OR_CONFIG_FAILED:-}" = "true" ]; then
     echo "  OpenRelik:    FAILED — check /opt/openrelik-pipeline/logs/or-config.log"
+    emit_install_audit install-error error openrelik
+    INSTALL_OVERALL_VERDICT=error
   else
     echo "  OpenRelik:    OK"
   fi
@@ -1601,6 +1639,8 @@ fi
 if [ "${INSTALL_VR}" = "true" ]; then
   if [ "${VR_CONFIG_FAILED:-}" = "true" ]; then
     echo "  Velociraptor: FAILED — check /opt/openrelik-pipeline/logs/vr-config.log"
+    emit_install_audit install-error error velociraptor
+    INSTALL_OVERALL_VERDICT=error
   else
     echo "  Velociraptor: OK"
   fi
@@ -1610,6 +1650,8 @@ fi
 
 echo "  Promtail:     ${PROMTAIL_STATUS}"
 echo "  TS Audit:     ${TS_AUDIT_STATUS}"
+
+emit_install_audit install-complete "${INSTALL_OVERALL_VERDICT}"
 
 # Clean up sensitive files — always remove vault credentials
 rm -f /etc/azure.cfg 2>/dev/null

@@ -33,6 +33,10 @@ services:
       # (The old /opt/vr_data mount from PR #17 was wrong — that path is
       # empty on the LXC host; VR writes inside /opt/velociraptor/.)
       - /opt/velociraptor/vr_data:/opt/velociraptor/vr_data:ro
+      # install.sh structured audit trail (install-start/error/complete).
+      # install.audit.log is JSON-per-line; rotated master install.log in
+      # the same dir is also available if a future PR wants to ship it.
+      - /opt/openrelik-pipeline/logs:/opt/openrelik-pipeline/logs:ro
       - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
       - ./positions:/positions
     # Scratch image has no wget/curl — bind health port on localhost
