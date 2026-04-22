@@ -213,7 +213,23 @@ fi
 
 set -a
 source "${CONFIG_FILE}"
+
+# Phase 4A: when vote launch provisioned per-case Authentik apps, it pushed
+# /etc/vote-case-authentik.env into the LXC with per-case client_id/secret
+# and app slugs. Sourcing AFTER config.env intentionally — per-case values
+# override the shared-app values in the vault. Absent file = stay on shared-
+# app path (backwards compatible).
+if [ -f /etc/vote-case-authentik.env ]; then
+  source /etc/vote-case-authentik.env
+  echo "Per-case Authentik creds loaded from /etc/vote-case-authentik.env (Phase 4A)"
+fi
 set +a
+
+# Authentik application slugs — defaults match the pre-Phase-4A shared apps.
+# Overridden per-case by the file loaded above.
+AUTHENTIK_OR_APP_SLUG="${AUTHENTIK_OR_APP_SLUG:-openrelik}"
+AUTHENTIK_TS_APP_SLUG="${AUTHENTIK_TS_APP_SLUG:-time-sketch}"
+AUTHENTIK_VR_APP_SLUG="${AUTHENTIK_VR_APP_SLUG:-velociraptor}"
 
 # Default local registry mirror — nginx-server on the vRack. vault config.env
 # can override. Everything below this line can reference ${REGISTRY_MIRROR}
@@ -449,7 +465,7 @@ EOF
     sed -i "s|^GOOGLE_OIDC_ENABLED = False|GOOGLE_OIDC_ENABLED = True|" "$TS_CONF"
     sed -i "s|^GOOGLE_OIDC_CLIENT_ID = .*|GOOGLE_OIDC_CLIENT_ID = '${AUTHENTIK_TS_CLIENT_ID}'|" "$TS_CONF"
     sed -i "s|^GOOGLE_OIDC_CLIENT_SECRET = .*|GOOGLE_OIDC_CLIENT_SECRET = '${AUTHENTIK_TS_CLIENT_SECRET}'|" "$TS_CONF"
-    sed -i "s|^GOOGLE_OIDC_DISCOVERY_URL = .*|GOOGLE_OIDC_DISCOVERY_URL = '${AUTHENTIK_BASE_URL}/application/o/time-sketch/.well-known/openid-configuration'|" "$TS_CONF"
+    sed -i "s|^GOOGLE_OIDC_DISCOVERY_URL = .*|GOOGLE_OIDC_DISCOVERY_URL = '${AUTHENTIK_BASE_URL}/application/o/${AUTHENTIK_TS_APP_SLUG}/.well-known/openid-configuration'|" "$TS_CONF"
 
     # Auth URL — Authentik's authorize endpoint
     sed -i "s|^GOOGLE_OIDC_AUTH_URL = .*|GOOGLE_OIDC_AUTH_URL = '${AUTHENTIK_BASE_URL}/application/o/authorize/'|" "$TS_CONF"
@@ -664,7 +680,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
 [auth.oidc]
 client_id = "${AUTHENTIK_OR_CLIENT_ID}"
 client_secret = "${AUTHENTIK_OR_CLIENT_SECRET}"
-discovery_url = "${AUTHENTIK_BASE_URL}/application/o/openrelik/.well-known/openid-configuration"
+discovery_url = "${AUTHENTIK_BASE_URL}/application/o/${AUTHENTIK_OR_APP_SLUG}/.well-known/openid-configuration"
 allowlist = []
 redirect_uri = "${OR_URL}/auth/oidc"
 EOF
@@ -1032,7 +1048,7 @@ if [ "${INSTALL_VR}" = "true" ]; then
   VR_GUI_EXTRA=""
   if [ "${ENVIRONMENT}" = "prod" ] && [ -n "${AUTHENTIK_VR_CLIENT_ID:-}" ]; then
     AUTHENTIK_BASE_URL="${AUTHENTIK_BASE_URL:-https://auth.dev.cypfer.io}"
-    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/velociraptor/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\"}"
+    VR_GUI_EXTRA=", \"authenticator\": {\"type\": \"oidc\", \"oidc_issuer\": \"${AUTHENTIK_BASE_URL}/application/o/${AUTHENTIK_VR_APP_SLUG}/\", \"oidc_name\": \"authentik\", \"oauth_client_id\": \"${AUTHENTIK_VR_CLIENT_ID}\", \"oauth_client_secret\": \"${AUTHENTIK_VR_CLIENT_SECRET}\"}"
     echo "Velociraptor OIDC enabled (Authentik). New users must be pre-created via 'velociraptor user add' until Phase 4 RBAC."
   elif [ "${ENVIRONMENT}" = "prod" ]; then
     echo "AUTHENTIK_VR_CLIENT_ID not set — Velociraptor using local auth only"
