@@ -209,6 +209,43 @@ if [ "$ACTION" != "upsert" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. Share every folder with the "Everyone" group (EDITOR).
+#
+# OR's folder model is strictly per-user unless an explicit grouprole or
+# userrole row grants access. Being an OR admin (is_admin=true) does NOT
+# surface other users' folders in the default listing. configure.py creates
+# the CYPFER folder tree (Cases, Active, Closed, Archive, Triage, Timelines,
+# Shared, etc.) owned by the `admin` service account, so every SSO analyst
+# signs in to an empty folder view until this step runs.
+#
+# OR ships a built-in "Everyone" group that automatically contains every
+# user -- including OIDC users provisioned on first login. Adding a single
+# grouprole(group=Everyone, folder=f, role=EDITOR) per folder shares it
+# with all present and future users in one row, rather than iterating the
+# roster (which wouldn't cover users added after this run).
+#
+# EDITOR lets analysts upload evidence, create subfolders, and run workflows.
+# Only OWNER can delete the folder itself, so the structural folder tree
+# stays protected.
+#
+# Idempotent: NOT EXISTS guards against duplicating rows on re-run.
+# ---------------------------------------------------------------------------
+OR_SHARE_SQL="
+INSERT INTO grouprole (role, group_id, folder_id, created_at, updated_at, is_deleted, is_purged)
+SELECT 'EDITOR', (SELECT id FROM \"group\" WHERE name = 'Everyone'), f.id, NOW(), NOW(), false, false
+FROM folder f
+WHERE f.is_deleted = false
+AND NOT EXISTS (
+    SELECT 1 FROM grouprole gr
+    JOIN \"group\" g ON gr.group_id = g.id
+    WHERE g.name = 'Everyone' AND gr.folder_id = f.id AND gr.is_deleted = false
+);
+"
+docker exec -i openrelik-postgres psql -U openrelik -d openrelik -c "$OR_SHARE_SQL" >/dev/null 2>&1 \
+    && log "folder share (Everyone → EDITOR): applied" \
+    || log "WARNING: folder share SQL failed — check Everyone group exists"
+
+# ---------------------------------------------------------------------------
 # 5. Reload OR to pick up the settings.toml allowlist change.
 # ---------------------------------------------------------------------------
 (cd "$OR_COMPOSE_DIR" && docker compose restart openrelik-server >/dev/null 2>&1) \
