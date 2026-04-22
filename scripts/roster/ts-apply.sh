@@ -129,14 +129,22 @@ done
 # ---------------------------------------------------------------------------
 # 4. Soft-revoke any @-shaped TS user whose email isn't in the roster.
 #    Admin flag cleared + disable-user; DB record stays.
+#
+#    Gated on ACTION != "upsert" so that a serial `vote grant` sequence
+#    doesn't disable existing users during the partial-roster states
+#    between calls. install.sh's install-time run leaves ACTION unset
+#    (default "apply") and still sweeps; `vote revoke` passes "delete"
+#    and still sweeps.
 # ---------------------------------------------------------------------------
-for u in "${TS_USERS[@]}"; do
-    if ! roster_has "$u"; then
-        ts_exec revoke-admin "$u" || true
-        ts_exec disable-user "$u" || true
-        log "  $u: not in roster — disabled (soft revoke)"
-    fi
-done
+if [ "$ACTION" != "upsert" ]; then
+    for u in "${TS_USERS[@]}"; do
+        if ! roster_has "$u"; then
+            ts_exec revoke-admin "$u" || true
+            ts_exec disable-user "$u" || true
+            log "  $u: not in roster — disabled (soft revoke)"
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Explicit revoke target — defensive; step 4 usually already caught it.
