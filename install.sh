@@ -846,7 +846,18 @@ log2timeline.py --version || true
 psort.py --version || true
 ' 2>&1 | tee /opt/openrelik-pipeline/logs/plaso-upgrade.log
 
-  docker compose restart openrelik-worker-plaso
+  # Explicit -f on the compose commands below so they don't depend on the
+  # current working directory. install.sh has `cd /opt/openrelik-pipeline`
+  # earlier in the flow, and from that cwd `docker compose restart
+  # openrelik-worker-plaso` and `docker compose exec openrelik-server`
+  # silently resolve against the pipeline's compose file -- which defines
+  # neither service, only `openrelik-pipeline` -- and return empty output.
+  # Case 9998 surfaced this as `len=0` on the API key capture; the Plaso
+  # restart was broken the same way but nobody noticed because it had no
+  # downstream validation.
+  OR_COMPOSE=/opt/openrelik/docker-compose.yml
+
+  docker compose -f "${OR_COMPOSE}" restart openrelik-worker-plaso
 
   # Capture the API key with -T so docker compose does not allocate a TTY.
   # With a TTY, typer/rich wrap the JWT at ~80 cols and emit ANSI escapes
@@ -857,12 +868,12 @@ psort.py --version || true
   # sed silently clears OPENRELIK_API_KEY in docker-compose.yml and the
   # pipeline container boots with no credentials, producing confusing
   # "API key has expired" errors on every POST from Velociraptor.
-  OPENRELIK_API_KEY="$(COLUMNS=1000 docker compose exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
+  OPENRELIK_API_KEY="$(COLUMNS=1000 docker compose -f "${OR_COMPOSE}" exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:cntrl:][:space:]')
   if [ "${#OPENRELIK_API_KEY}" -lt 100 ] || ! echo "$OPENRELIK_API_KEY" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
     echo "ERROR: captured OPENRELIK_API_KEY does not look like a JWT (len=${#OPENRELIK_API_KEY})"
     echo "       admin.py create-api-key output (for diagnosis):"
-    COLUMNS=1000 docker compose exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer-debug" 2>&1 | head -20 || true
+    COLUMNS=1000 docker compose -f "${OR_COMPOSE}" exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer-debug" 2>&1 | head -20 || true
     exit 1
   fi
 
