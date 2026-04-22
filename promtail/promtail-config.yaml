@@ -271,3 +271,33 @@ scrape_configs:
           actor:
           action: event
           verdict: verdict_static
+
+  # install.sh structured audit trail (install-start, install-error,
+  # install-complete). Emitted by emit_install_audit() in install.sh as
+  # JSON-per-line into /opt/openrelik-pipeline/logs/install.audit.log.
+  # Powers the case-lifecycle alert rules in microcloud's lgtm.
+  - job_name: case-install-audit
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: case-install-audit
+          host: case-__CASE_ID__
+          source: case-install
+          class: audit
+          case: '__CASE_ID__'
+          __path__: /opt/openrelik-pipeline/logs/install.audit.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: ts
+            action: action
+            verdict: verdict
+            component: component
+      - labels:
+          action:
+          verdict:
+          component:
+      - timestamp:
+          source: ts
+          format: RFC3339
