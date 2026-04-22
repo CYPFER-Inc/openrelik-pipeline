@@ -846,7 +846,18 @@ log2timeline.py --version || true
 psort.py --version || true
 ' 2>&1 | tee /opt/openrelik-pipeline/logs/plaso-upgrade.log
 
-  docker compose restart openrelik-worker-plaso
+  # Explicit -f on the compose commands below so they don't depend on the
+  # current working directory. install.sh has `cd /opt/openrelik-pipeline`
+  # earlier in the flow, and from that cwd `docker compose restart
+  # openrelik-worker-plaso` and `docker compose exec openrelik-server`
+  # silently resolve against the pipeline's compose file -- which defines
+  # neither service, only `openrelik-pipeline` -- and return empty output.
+  # Case 9998 surfaced this as `len=0` on the API key capture; the Plaso
+  # restart was broken the same way but nobody noticed because it had no
+  # downstream validation.
+  OR_COMPOSE=/opt/openrelik/docker-compose.yml
+
+  docker compose -f "${OR_COMPOSE}" restart openrelik-worker-plaso
 
   # Capture the API key with -T so docker compose does not allocate a TTY.
   # With a TTY, typer/rich wrap the JWT at ~80 cols and emit ANSI escapes
@@ -857,12 +868,12 @@ psort.py --version || true
   # sed silently clears OPENRELIK_API_KEY in docker-compose.yml and the
   # pipeline container boots with no credentials, producing confusing
   # "API key has expired" errors on every POST from Velociraptor.
-  OPENRELIK_API_KEY="$(COLUMNS=1000 docker compose exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
+  OPENRELIK_API_KEY="$(COLUMNS=1000 docker compose -f "${OR_COMPOSE}" exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer")"
   OPENRELIK_API_KEY=$(echo "$OPENRELIK_API_KEY" | tr -d '[:cntrl:][:space:]')
   if [ "${#OPENRELIK_API_KEY}" -lt 100 ] || ! echo "$OPENRELIK_API_KEY" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
     echo "ERROR: captured OPENRELIK_API_KEY does not look like a JWT (len=${#OPENRELIK_API_KEY})"
     echo "       admin.py create-api-key output (for diagnosis):"
-    COLUMNS=1000 docker compose exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer-debug" 2>&1 | head -20 || true
+    COLUMNS=1000 docker compose -f "${OR_COMPOSE}" exec -T openrelik-server python admin.py create-api-key admin --key-name "cypfer-debug" 2>&1 | head -20 || true
     exit 1
   fi
 
@@ -950,7 +961,19 @@ psort.py --version || true
   fi
 
   echo "Deploying OpenRelik Timesketch worker..."
-  line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
+  # Use absolute path — cwd at this point is /opt/openrelik-pipeline (whose
+  # compose has no `volumes:` section). Without absolute path, grep silently
+  # returns empty, $((line - 1)) evaluates to -1, sed sees "-1" as a flag and
+  # aborts with "invalid option -- '1'". The worker never gets injected, and
+  # every "Upload to Timesketch" task silently queues forever. Surfaced on
+  # case-2073.
+  OR_COMPOSE=/opt/openrelik/docker-compose.yml
+
+  line=$(grep -n "^volumes:" "${OR_COMPOSE}" | head -n1 | cut -d: -f1)
+  if [ -z "${line}" ]; then
+    echo "ERROR: no 'volumes:' anchor in ${OR_COMPOSE} — cannot inject openrelik-worker-timesketch"
+    exit 1
+  fi
   insert_line=$((line - 1))
 
   TIMESKETCH_WORKER_DIGEST=$(grep OPENRELIK_WORKER_TIMESKETCH_DIGEST /opt/openrelik-pipeline/config.env | cut -d= -f2)
@@ -970,7 +993,15 @@ psort.py --version || true
       volumes:\\
         - ./data:/usr/share/openrelik/data\\
       command: \"celery --app=src.app worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-timesketch\"
-" docker-compose.yml
+" "${OR_COMPOSE}"
+
+  # Post-injection validation: if the sed didn't land (unexpected compose
+  # structure, escaping regression, etc.), fail the install loudly instead of
+  # leaving the OR pipeline half-wired.
+  if ! grep -q "openrelik-worker-timesketch:" "${OR_COMPOSE}"; then
+    echo "ERROR: openrelik-worker-timesketch block was not injected into ${OR_COMPOSE}"
+    exit 1
+  fi
 
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then

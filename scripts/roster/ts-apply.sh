@@ -127,6 +127,46 @@ for i in "${!EMAILS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
+# 3b. Grant every roster user access to every sketch.
+#
+# TS sketches (and all the saved searches / tags / aggregations attached to
+# them) are strictly ACL-scoped: a user only sees a sketch in "My Sketches"
+# if they have an entry in sketch_accesscontrolentry. Being a TS admin does
+# NOT surface other users' sketches in the default view — they appear only
+# under "Shared with me" if an ACL entry exists.
+#
+# configure.py creates the default "CYPFER Case-{id}" sketch as the admin
+# service account. Without this step, every SSO analyst signs in to an
+# empty dashboard even though the sketch is sitting there with 23 saved
+# searches, 36 tags, and 8 aggregations already configured.
+#
+# `tsctl grant-user USERNAME --sketch_id N` is idempotent (no duplicate
+# sketch_accesscontrolentry rows on re-run) and grants read + write + delete.
+# No matching `tsctl revoke-user` exists, so on soft-revoke we rely on
+# disable-user (step 4) to block login — the stale ACL rows are harmless
+# while the user is disabled.
+# ---------------------------------------------------------------------------
+mapfile -t SKETCH_IDS < <(
+    docker exec postgres psql -U timesketch -d timesketch -At -c \
+        "SELECT id FROM sketch ORDER BY id;" 2>/dev/null
+)
+
+if [ "${#SKETCH_IDS[@]}" -eq 0 ]; then
+    log "  no sketches yet — skipping ACL grants"
+else
+    for i in "${!EMAILS[@]}"; do
+        email="${EMAILS[$i]}"
+        for sid in "${SKETCH_IDS[@]}"; do
+            # grant-user can't revoke admin flags or affect login — safe to
+            # run without a role gate. Swallow failures (sketch deleted mid-
+            # run, user vanished) so one bad row doesn't abort the loop.
+            ts_exec grant-user "$email" --sketch_id "$sid" || true
+        done
+        log "  $email: granted access to ${#SKETCH_IDS[@]} sketch(es)"
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Soft-revoke any @-shaped TS user whose email isn't in the roster.
 #    Admin flag cleared + disable-user; DB record stays.
 #
