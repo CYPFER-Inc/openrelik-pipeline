@@ -961,7 +961,19 @@ psort.py --version || true
   fi
 
   echo "Deploying OpenRelik Timesketch worker..."
-  line=$(grep -n "^volumes:" docker-compose.yml | head -n1 | cut -d: -f1)
+  # Use absolute path — cwd at this point is /opt/openrelik-pipeline (whose
+  # compose has no `volumes:` section). Without absolute path, grep silently
+  # returns empty, $((line - 1)) evaluates to -1, sed sees "-1" as a flag and
+  # aborts with "invalid option -- '1'". The worker never gets injected, and
+  # every "Upload to Timesketch" task silently queues forever. Surfaced on
+  # case-2073.
+  OR_COMPOSE=/opt/openrelik/docker-compose.yml
+
+  line=$(grep -n "^volumes:" "${OR_COMPOSE}" | head -n1 | cut -d: -f1)
+  if [ -z "${line}" ]; then
+    echo "ERROR: no 'volumes:' anchor in ${OR_COMPOSE} — cannot inject openrelik-worker-timesketch"
+    exit 1
+  fi
   insert_line=$((line - 1))
 
   TIMESKETCH_WORKER_DIGEST=$(grep OPENRELIK_WORKER_TIMESKETCH_DIGEST /opt/openrelik-pipeline/config.env | cut -d= -f2)
@@ -981,7 +993,15 @@ psort.py --version || true
       volumes:\\
         - ./data:/usr/share/openrelik/data\\
       command: \"celery --app=src.app worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-timesketch\"
-" docker-compose.yml
+" "${OR_COMPOSE}"
+
+  # Post-injection validation: if the sed didn't land (unexpected compose
+  # structure, escaping regression, etc.), fail the install loudly instead of
+  # leaving the OR pipeline half-wired.
+  if ! grep -q "openrelik-worker-timesketch:" "${OR_COMPOSE}"; then
+    echo "ERROR: openrelik-worker-timesketch block was not injected into ${OR_COMPOSE}"
+    exit 1
+  fi
 
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
