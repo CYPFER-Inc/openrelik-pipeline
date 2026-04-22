@@ -19,12 +19,22 @@
 # Idempotent. Safe to run repeatedly.
 #
 # USAGE:
-#   bash or-apply.sh [<roster-file>]
-#   default: /opt/openrelik-pipeline/rosters/or.env
+#   bash or-apply.sh [<roster-file>] [apply|upsert|delete] [<target-email>]
+#
+#   action:
+#     apply   (default, for install-time full reconcile) — reconciles state
+#             against the roster AND sweeps: users in OR but not in the roster
+#             are admin-stripped + removed from the allowlist (soft revoke).
+#     upsert  (used by `vote grant`) — applies the roster but DOES NOT sweep.
+#             Prevents a serial `vote grant` sequence from soft-revoking
+#             existing users during the partial-roster states between calls.
+#     delete  (used by `vote revoke`) — same as apply; sweep runs.
 # =============================================================================
 set -euo pipefail
 
 ROSTER="${1:-/opt/openrelik-pipeline/rosters/or.env}"
+ACTION="${2:-apply}"
+TARGET_EMAIL="${3:-}"
 OR_SETTINGS="/opt/openrelik/config/settings.toml"
 OR_COMPOSE_DIR="/opt/openrelik"
 
@@ -69,9 +79,36 @@ log "roster: ${#EMAILS[@]} entries"
 # ---------------------------------------------------------------------------
 # 2. Patch [auth.oidc].allowlist in settings.toml
 # ---------------------------------------------------------------------------
-# Build the TOML array payload.
+# On upsert, compute the allowlist as the UNION of the current allowlist and
+# the roster emails — so a `vote grant` mid-sequence doesn't shrink the
+# allowlist to the partial roster. On apply (install-time full reconcile)
+# and delete (explicit revoke), regenerate from roster so shrinkage works
+# the way those flows expect.
+declare -a ALLOWLIST_EMAILS=("${EMAILS[@]}")
+if [ "$ACTION" = "upsert" ]; then
+    # Extract current allowlist emails from settings.toml, only from the
+    # [auth.oidc] section. awk scopes to the section, grep -oE extracts
+    # every quoted email.
+    mapfile -t CURRENT_ALLOWLIST < <(
+        awk '
+            /^\[auth\.oidc\]/ { in_oidc = 1; next }
+            /^\[/ && !/^\[auth\.oidc\]/ { in_oidc = 0 }
+            in_oidc && /^[[:space:]]*allowlist[[:space:]]*=/ { print }
+        ' "$OR_SETTINGS" | grep -oE '"[^"]+"' | tr -d '"'
+    )
+    for e in "${CURRENT_ALLOWLIST[@]}"; do
+        in_roster=0
+        for r in "${EMAILS[@]}"; do
+            [ "$r" = "$e" ] && { in_roster=1; break; }
+        done
+        [ "$in_roster" = "0" ] && ALLOWLIST_EMAILS+=("$e")
+    done
+fi
+
+# Build the TOML array payload from ALLOWLIST_EMAILS (may be wider than
+# roster on upsert; equals roster on apply/delete).
 toml_list=""
-for e in "${EMAILS[@]}"; do
+for e in "${ALLOWLIST_EMAILS[@]}"; do
     toml_list+="\"${e}\", "
 done
 toml_list="${toml_list%, }"
@@ -145,24 +182,31 @@ done
 #    Query postgres for usernames containing '@' (email-shaped — filters out
 #    the local `admin` service account). Roster is source of truth; anyone
 #    OIDC-shaped in the DB but not in the roster was revoked.
+#
+#    Gated on ACTION != "upsert" so that a serial `vote grant` sequence
+#    doesn't sweep existing users in the partial-roster states between
+#    calls. install.sh's install-time full reconcile passes ACTION="apply"
+#    (default); `vote revoke` passes ACTION="delete" and still sweeps.
 # ---------------------------------------------------------------------------
-mapfile -t OR_USERS < <(
-    docker exec openrelik-postgres psql -U openrelik -d openrelik -t -A -c \
-        "SELECT username FROM \"user\" WHERE username LIKE '%@%';" 2>/dev/null
-)
+if [ "$ACTION" != "upsert" ]; then
+    mapfile -t OR_USERS < <(
+        docker exec openrelik-postgres psql -U openrelik -d openrelik -t -A -c \
+            "SELECT username FROM \"user\" WHERE username LIKE '%@%';" 2>/dev/null
+    )
 
-roster_has() {
-    local needle="$1"
-    for e in "${EMAILS[@]}"; do [ "$e" = "$needle" ] && return 0; done
-    return 1
-}
+    roster_has() {
+        local needle="$1"
+        for e in "${EMAILS[@]}"; do [ "$e" = "$needle" ] && return 0; done
+        return 1
+    }
 
-for u in "${OR_USERS[@]}"; do
-    if ! roster_has "$u"; then
-        or_set_admin "$u" "false"
-        log "  $u: not in roster — demoted (kept in DB for audit)"
-    fi
-done
+    for u in "${OR_USERS[@]}"; do
+        if ! roster_has "$u"; then
+            or_set_admin "$u" "false"
+            log "  $u: not in roster — demoted (kept in DB for audit)"
+        fi
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Reload OR to pick up the settings.toml allowlist change.
