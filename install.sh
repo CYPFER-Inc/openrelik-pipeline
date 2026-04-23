@@ -1134,7 +1134,7 @@ if [ "${INSTALL_VR}" = "true" ]; then
     ports:
       - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
-      - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
+      - "8889:8889" """ | sudo tee ./docker-compose.yml > /dev/null
 
   VR_BASE_IMAGE=$(mirror_image "ubuntu:22.04")
   # openssl + python3 + python3-yaml are needed for the per-case Frontend cert
