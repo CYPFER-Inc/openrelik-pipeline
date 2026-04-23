@@ -1,0 +1,23 @@
+[Unit]
+Description=Phase 4B Authentik → roster reconciler
+Documentation=https://github.com/CYPFER-Inc/microcloud/blob/main/docs/phase4b-authentik-source-of-truth.md
+# Don't start before networking is up — Authentik is reached over the
+# public internet (→ services-1.dev.cypfer.io) from inside the case LXC.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/authentik-sync/authentik-sync.sh
+# Reconciler runs as root because it writes /opt/openrelik-pipeline/rosters/*
+# (0600 root-owned) and invokes the applier scripts which exec into the app
+# containers via docker.
+User=root
+Group=root
+# Keep stderr flowing to journald; the stdout/log is appended to
+# /var/log/authentik-sync.log by the script itself.
+StandardOutput=journal
+StandardError=journal
+# Sanity: never let a tick hang the timer. Reconciler should complete in
+# single-digit seconds; 60s kill is a wide margin.
+TimeoutStartSec=60

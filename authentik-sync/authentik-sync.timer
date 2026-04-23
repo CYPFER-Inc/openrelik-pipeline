@@ -1,0 +1,16 @@
+[Unit]
+Description=Phase 4B Authentik → roster reconciler (60s cadence)
+Documentation=https://github.com/CYPFER-Inc/microcloud/blob/main/docs/phase4b-authentik-source-of-truth.md
+
+[Timer]
+# First tick: 60s after boot so the LXC has time to finish install.sh
+# before the reconciler starts sweeping.
+OnBootSec=60s
+# Steady-state: 60s after the previous tick completes. Previous design
+# decision (Q1). AccuracySec=1s keeps ticks close to their schedule.
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=authentik-sync.service
+
+[Install]
+WantedBy=timers.target
