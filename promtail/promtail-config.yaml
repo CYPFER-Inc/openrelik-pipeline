@@ -301,3 +301,41 @@ scrape_configs:
       - timestamp:
           source: ts
           format: RFC3339
+
+  # Phase 4B authentik-sync reconciler. Emits one JSON line per tick (60s
+  # cadence) to /var/log/authentik-sync.log. Shape:
+  #   {"ts":"...","caseid":"3008","rc":0,
+  #    "drift":{"or":false,"ts":false,"vr":false},"members_count":3,
+  #    "applier_rc":{"or":0,"ts":0,"vr":0},
+  #    "mass_revoke_skipped":{"or":false,"ts":false,"vr":false},
+  #    "error":null}
+  #
+  # Labels promoted to the index:
+  #   rc — 0 (ok), 1 (Authentik unreachable), 2 (applier failure). Powers
+  #        the auth-failures + applier-failures alerts.
+  # Everything else stays in the log body and is queryable via `| json`.
+  # tick_stalled is detected by the alert rule via absence-of-series.
+  - job_name: authentik-sync
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: authentik-sync
+          host: case-__CASE_ID__
+          source: authentik-sync
+          class: ops
+          case: '__CASE_ID__'
+          __path__: /var/log/authentik-sync.log
+    pipeline_stages:
+      - json:
+          expressions:
+            ts: ts
+            rc: rc
+      - template:
+          source: rc
+          template: '{{ default "" .rc }}'
+      - labels:
+          rc:
+      - timestamp:
+          source: ts
+          format: RFC3339
