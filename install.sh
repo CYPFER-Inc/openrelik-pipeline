@@ -1636,6 +1636,110 @@ elif [ -z "${LOKI_URL:-}" ]; then
   PROMTAIL_STATUS="skipped (no LOKI_URL)"
 fi
 
+# ─── Phase 4B: authentik-sync reconciler + bootstrap seed ────────────────────
+# When /etc/authentik-sync.env is present (vote.sh writes it under PHASE4B=1),
+# (1) seed the case-<CASE_ID>-<role> Authentik groups with the bootstrap users
+#     so the reconciler's first tick sees them and doesn't mass-revoke;
+# (2) deploy the reconciler + systemd units + enable the 60s timer.
+#
+# No-op when /etc/authentik-sync.env is absent — pre-4B cases and 4A-only
+# cases continue through without the reconciler.
+AUTHENTIK_SYNC_STATUS="skipped (not PHASE4B)"
+if [ -r /etc/authentik-sync.env ]; then
+  echo ""
+  echo "Phase 4B: seeding Authentik bootstrap + deploying authentik-sync..."
+  AUTHENTIK_SYNC_FAILED="false"
+  (
+    # Subshell so sourced env doesn't leak into later sections.
+    set -e
+    . /etc/authentik-sync.env  # AUTHENTIK_BASE_URL, AUTHENTIK_API_TOKEN
+    . /etc/vote-case.env       # CASE_ID
+
+    AK_API="${AUTHENTIK_BASE_URL%/}/api/v3"
+
+    # Union TS/OR/VR bootstrap lists with admin > investigator > reader
+    # precedence, so each user shows up in exactly one role group.
+    declare -A B
+    for csv in "${TS_BOOTSTRAP_USERS:-}" "${OR_BOOTSTRAP_USERS:-}" "${VR_BOOTSTRAP_USERS:-}"; do
+      IFS=',' read -ra PAIRS <<< "$csv"
+      for entry in "${PAIRS[@]}"; do
+        entry=$(echo "$entry" | xargs)
+        [ -z "$entry" ] && continue
+        email="${entry%%:*}"
+        role="${entry#*:}"
+        [ "$role" = "$entry" ] && role="reader"
+        case "$role" in admin|investigator|reader) ;; *) role="reader" ;; esac
+        current="${B[$email]:-}"
+        # Precedence: if current is admin, keep. If current is investigator
+        # and new isn't admin, keep. Otherwise overwrite.
+        if [ "$current" = "admin" ]; then continue; fi
+        if [ "$current" = "investigator" ] && [ "$role" != "admin" ]; then continue; fi
+        B[$email]=$role
+      done
+    done
+
+    # Cache group pks.
+    declare -A GROUP_PK
+    for r in admin investigator reader; do
+      gname="case-${CASE_ID}-${r}"
+      pk=$(curl -sS -H "Authorization: Bearer $AUTHENTIK_API_TOKEN" \
+            "$AK_API/core/groups/?name=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$gname")" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("results",[{}])[0]; print(r.get("pk",""))')
+      if [ -z "$pk" ]; then
+        echo "  ERROR: Authentik group $gname not found — case not fully provisioned"
+        exit 1
+      fi
+      GROUP_PK[$r]=$pk
+    done
+
+    # Add each bootstrap user to their group.
+    for email in "${!B[@]}"; do
+      role="${B[$email]}"
+      user_pk=$(curl -sS -H "Authorization: Bearer $AUTHENTIK_API_TOKEN" \
+                 "$AK_API/core/users/?email=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$email")" \
+                 | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("results",[{}])[0]; print(r.get("pk",""))')
+      if [ -z "$user_pk" ]; then
+        echo "  SKIP: $email not in Authentik (create via UI first)"
+        continue
+      fi
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+             -H "Authorization: Bearer $AUTHENTIK_API_TOKEN" \
+             -H "Content-Type: application/json" \
+             -d "{\"pk\":$user_pk}" \
+             "$AK_API/core/groups/${GROUP_PK[$role]}/add_user/")
+      if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
+        echo "  OK: $email → case-${CASE_ID}-${role}"
+      else
+        echo "  WARN: add_user $email → case-${CASE_ID}-${role} returned HTTP $code"
+      fi
+    done
+
+    # Deploy reconciler + units.
+    install -d -m 0755 /opt/authentik-sync
+    install -m 0755 "${SCRIPT_DIR}/authentik-sync/authentik-sync.sh"      /opt/authentik-sync/authentik-sync.sh
+    install -m 0644 "${SCRIPT_DIR}/authentik-sync/authentik-sync.service" /etc/systemd/system/authentik-sync.service
+    install -m 0644 "${SCRIPT_DIR}/authentik-sync/authentik-sync.timer"   /etc/systemd/system/authentik-sync.timer
+
+    # Log file needs to exist before promtail tails it; 0640 root:adm keeps
+    # it readable for promtail without broadening the reconciler's writes.
+    touch /var/log/authentik-sync.log
+    chmod 0640 /var/log/authentik-sync.log
+    chown root:adm /var/log/authentik-sync.log 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl enable --now authentik-sync.timer
+    echo "  authentik-sync.timer enabled (60s cadence)"
+  ) || AUTHENTIK_SYNC_FAILED="true"
+
+  if [ "$AUTHENTIK_SYNC_FAILED" = "true" ]; then
+    echo "Phase 4B: deploy FAILED — authentik-sync not running, reconciliation disabled"
+    AUTHENTIK_SYNC_STATUS="FAILED"
+    emit_install_audit install-error error authentik-sync
+  else
+    AUTHENTIK_SYNC_STATUS="OK"
+  fi
+fi
+
 echo "═══════════════════════════════════════════════════"
 echo "Install complete"
 
@@ -1679,8 +1783,9 @@ else
   echo "  Velociraptor: skipped"
 fi
 
-echo "  Promtail:     ${PROMTAIL_STATUS}"
-echo "  TS Audit:     ${TS_AUDIT_STATUS}"
+echo "  Promtail:        ${PROMTAIL_STATUS}"
+echo "  TS Audit:        ${TS_AUDIT_STATUS}"
+echo "  authentik-sync:  ${AUTHENTIK_SYNC_STATUS}"
 
 emit_install_audit install-complete "${INSTALL_OVERALL_VERDICT}"
 
