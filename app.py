@@ -48,6 +48,53 @@ def create_folder(folder_name):
     return response
 
 
+# Default group + role granted read access when a new case folder is created
+# by /api/triage/timesketch?case_id=... . Exposed as env vars so the deployment
+# can tune without a code change if OpenRelik's role vocabulary differs from
+# the defaults below.
+CASE_FOLDER_READ_GROUP = os.getenv("CASE_FOLDER_READ_GROUP", "Everyone")
+CASE_FOLDER_READ_ROLE = os.getenv("CASE_FOLDER_READ_ROLE", "Reader")
+
+
+def find_or_create_case_folder(case_id):
+    """
+    Return the folder_id of a top-level folder named case_id.
+
+    If no such folder exists, create it as a root folder and grant the
+    configured group (default: Everyone) read access. On reuse, permissions
+    are left as-is — if an admin has since hand-tuned the ACL in the UI,
+    we don't re-flatten it on every POST.
+
+    Returns the folder_id, or None if creation failed.
+    """
+    roots = folders_api.list_root_folders(1000) or []
+    for f in roots:
+        if f.get("display_name") == case_id:
+            return f["id"]
+
+    new_id = folders_api.create_root_folder(case_id)
+    if new_id is None:
+        return None
+
+    try:
+        folders_api.share_folder(
+            new_id,
+            group_names=[CASE_FOLDER_READ_GROUP],
+            group_role=CASE_FOLDER_READ_ROLE,
+        )
+    except Exception as exc:
+        # Folder was created successfully — only the ACL grant failed.
+        # Log and continue so admin still sees the workflow land; they
+        # can fix the share from the UI or by rerunning with a corrected
+        # CASE_FOLDER_READ_ROLE env var.
+        app.logger.warning(
+            "Case folder %s (id=%s) created but share to group %s with role %s failed: %s",
+            case_id, new_id, CASE_FOLDER_READ_GROUP, CASE_FOLDER_READ_ROLE, exc,
+        )
+
+    return new_id
+
+
 def upload_file(file_path, folder_id):
     """
     Upload a file to the specified folder.
@@ -1441,6 +1488,16 @@ def api_triage_timesketch():
     zips regardless of the specific artefacts inside. No per-worker
     hunts required in Velociraptor — one server-event artefact POSTs
     to this endpoint and the rest is automatic.
+
+    Form parameters:
+      file     (required) — the archive to triage
+      case_id  (optional) — if provided, the triage workflow is created
+                            inside a top-level case folder named case_id
+                            (e.g. "Case-2077"). If that folder doesn't
+                            exist, it's created and granted read access
+                            for CASE_FOLDER_READ_GROUP. If case_id is
+                            omitted, the old behaviour is preserved: a
+                            fresh root folder per zip.
     """
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -1450,6 +1507,8 @@ def api_triage_timesketch():
     timeline_name, _extension = os.path.splitext(filename)
     fqdn, _label = extract_fqdn_and_label(filename)
 
+    case_id = (request.form.get("case_id") or "").strip()
+
     sketch_id = 1
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""
@@ -1457,11 +1516,21 @@ def api_triage_timesketch():
     file_path = os.path.join("/tmp", filename)
     file.save(file_path)
 
-    folder_id = create_folder(f"{filename} Triage")
+    if case_id:
+        folder_id = find_or_create_case_folder(case_id)
+        if folder_id is None:
+            return jsonify({"error": f"Failed to find or create case folder {case_id!r}"}), 500
+    else:
+        folder_id = create_folder(f"{filename} Triage")
+
     file_id = upload_file(file_path, folder_id)
     workflow_id, workflow_folder_id = create_workflow(folder_id, [file_id])
 
-    rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
+    # In the legacy (no case_id) flow we rename the workflow's own folder
+    # to be analyst-friendly. In the case-folder flow we leave the workflow
+    # subfolder alone — the parent case folder is the navigation anchor.
+    if not case_id:
+        rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
     rename_workflow(folder_id, workflow_id, f"{filename} Triage Workflow")
 
     add_triage_ts_tasks_to_workflow(
@@ -1472,6 +1541,8 @@ def api_triage_timesketch():
     return jsonify(
         {
             "message": "Triage to Timesketch Workflow started successfully",
+            "case_id": case_id or None,
+            "case_folder_id": folder_id if case_id else None,
             "workflow_id": workflow_id,
             "run_details": run,
         }
