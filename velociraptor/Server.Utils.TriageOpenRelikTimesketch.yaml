@@ -1,0 +1,102 @@
+name: Custom.Server.Utils.TriageOpenRelikTimesketch
+description: |
+   Catchall triage dispatcher. Sends every collected KAPE-triage zip to the
+   OpenRelik catchall triage endpoint. OpenRelik extracts the zip, fans out
+   to every known analyser (Hayabusa, Chainsaw [hunt_evtx, builtin_only,
+   analyse_srum], Plaso), and uploads each analyser's output to Timesketch
+   as a separately named timeline in the same sketch.
+
+   Replaces the per-worker Server.Utils.Triage* artefacts — one hunt per
+   endpoint is all that's needed now. Filename: `vr_kapefiles_$fqdn_$label.zip`
+
+type: SERVER_EVENT
+
+parameters:
+   - name: ArtifactNameRegex
+     default: "Windows.Triage.Targets"
+     description: A regular expression to select which artifacts to upload
+   - name: Host
+     default: "http://openrelik-pipeline:5000"
+
+
+sources:
+  - query: |
+        LET output_file <= tempfile(extension=".zip")
+
+        LET host <= if(condition=Host, then=Host,
+           else=server_metadata().DefaultHost)
+
+        LET UploadFlowDefinition = '
+        name: UploadFlow
+
+        parameters:
+           - name: FlowId
+           - name: ClientId
+
+        sources:
+          - name: FlowDetails
+            query: SELECT * FROM flows(client_id=ClientId, flow_id=FlowId)
+          - query: |
+                SELECT * FROM foreach(
+                row={
+                    SELECT *, Data["VFSPath"] AS VFSPath
+                    FROM enumerate_flow(client_id=ClientId, flow_id=FlowId)
+                },
+                query={
+                  SELECT OSPath,
+                         upload(file=OSPath, accessor="fs") AS Upload
+                  FROM stat(filename=VFSPath, accessor="fs")
+                })
+        '
+
+        /*
+         * Move the http_client call into a second SELECT inside a foreach so
+         * we can properly do SELECT * FROM http_client(...).
+         */
+        LET upload_to_endpoint(ClientId, FlowId, Fqdn, Label) =
+            SELECT * FROM foreach(
+              row={
+                /* First step: produce the zip by collecting the flow's data */
+                SELECT * FROM collect(
+                  artifacts="UploadFlow",
+                  artifact_definitions=UploadFlowDefinition,
+                  args=dict(
+                    `UploadFlow`=dict(
+                      ClientId=ClientId,
+                      FlowId=FlowId
+                    )
+                  ),
+                  output=output_file
+                )
+              },
+              query={
+                /* Second step: zip is available, POST it via http_client */
+                SELECT * FROM http_client(
+                  method="POST",
+                  url=format(format="%v/api/triage/timesketch", args=[host]),
+                  files=dict(
+                    file=format(format="vr_kapefiles_%v_%v.zip", args=[Fqdn, Label]),
+                    key="file",
+                    path=output_file,
+                    accessor="file"
+                  )
+                )
+              }
+            )
+
+        LET completions = SELECT *, client_info(client_id=ClientId).os_info.fqdn AS Fqdn, client_info(client_id=ClientId).labels[0] as Label
+            FROM watch_monitoring(artifact="System.Flow.Completion")
+            WHERE Flow.artifacts_with_results =~ ArtifactNameRegex
+
+        /* For each matching flow completion, call upload_to_endpoint() */
+        SELECT * FROM foreach(
+            row=completions,
+            query={
+                SELECT * FROM upload_to_endpoint(
+                  ClientId=ClientId,
+                  FlowId=FlowId,
+                  Fqdn=Fqdn,
+                  Label=Label
+                )
+            }
+        )

@@ -1057,6 +1057,206 @@ def add_hayabusa_extract_ts_tasks_to_workflow(folder_id, workflow_id, sketch_nam
     return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
 
 
+def _ts_task_config(sketch_name, sketch_id, timeline_name):
+    """Build a Timesketch-upload task_config list, preferring sketch_id over sketch_name."""
+    base = [
+        {
+            "name": "timeline_name",
+            "label": "Name of the timeline to create",
+            "description": "Timeline name",
+            "type": "text",
+            "required": False,
+            "value": f"{timeline_name}",
+        }
+    ]
+    if sketch_id != "":
+        return [
+            {
+                "name": "sketch_id",
+                "label": "Add to existing sketch",
+                "description": "Add to existing sketch",
+                "type": "text",
+                "required": False,
+                "value": f"{sketch_id}",
+            },
+            *base,
+        ]
+    return [
+        {
+            "name": "sketch_name",
+            "label": "Create a new sketch",
+            "description": "Create a new sketch",
+            "type": "text",
+            "required": False,
+            "value": f"{sketch_name}",
+        },
+        *base,
+    ]
+
+
+def _ts_leaf(sketch_name, sketch_id, timeline_name):
+    """Return a Timesketch-upload task dict suitable for use as a leaf node in a workflow tree."""
+    return {
+        "task_name": "openrelik-worker-timesketch.tasks.upload",
+        "queue_name": "openrelik-worker-timesketch",
+        "display_name": "Upload to Timesketch",
+        "description": "Upload resulting file to Timesketch",
+        "task_config": _ts_task_config(sketch_name, sketch_id, timeline_name),
+        "type": "task",
+        "uuid": str(uuid.uuid4()).replace("-", ""),
+        "tasks": [],
+    }
+
+
+def add_triage_ts_tasks_to_workflow(
+    folder_id,
+    workflow_id,
+    sketch_name,
+    sketch_id,
+    timeline_name,
+    chainsaw_min_level="high",
+):
+    """
+    Catchall triage workflow: Extract → fan out to every known analyser → each
+    branch uploads its own timeline to Timesketch.
+
+    Layout:
+
+        extract_archive
+          ├── hayabusa csv_timeline        → ts (timeline: "<base> - Hayabusa")
+          ├── chainsaw hunt_evtx           → ts (timeline: "<base> - Chainsaw Sigma")
+          ├── chainsaw builtin_only        → ts (timeline: "<base> - Chainsaw Built-in")
+          ├── chainsaw analyse_srum        → ts (timeline: "<base> - Chainsaw SRUM")
+          └── plaso log2timeline           → ts (timeline: "<base> - Plaso")
+
+    Each worker's compatible-input filter picks up only what it knows and
+    silently no-ops on everything else — there is no pre-classification step.
+    All five branches run in parallel once extraction completes; each writes
+    a separately named timeline into the same sketch (via sketch_id).
+    """
+    extraction_uuid = str(uuid.uuid4()).replace("-", "")
+    hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
+    chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
+    chainsaw_builtin_uuid = str(uuid.uuid4()).replace("-", "")
+    chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
+    plaso_uuid = str(uuid.uuid4()).replace("-", "")
+
+    workflow_spec = {
+        "spec_json": json.dumps(
+            {
+                "workflow": {
+                    "type": "chain",
+                    "isRoot": True,
+                    "tasks": [
+                        {
+                            "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                            "queue_name": "openrelik-worker-extraction",
+                            "display_name": "Extract Archives",
+                            "description": "Extract files from archive for downstream analysers",
+                            "task_config": [],
+                            "type": "task",
+                            "uuid": f"{extraction_uuid}",
+                            "tasks": [
+                                {
+                                    "task_name": "openrelik-worker-hayabusa.tasks.csv_timeline",
+                                    "queue_name": "openrelik-worker-hayabusa",
+                                    "display_name": "Hayabusa CSV timeline",
+                                    "description": "Windows event log triage",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{hayabusa_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Hayabusa",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-chainsaw.tasks.hunt_evtx",
+                                    "queue_name": "openrelik-worker-chainsaw",
+                                    "display_name": "Chainsaw: Hunt EVTX (Sigma + built-ins)",
+                                    "description": "Run SigmaHQ + Chainsaw built-in rules against EVTX",
+                                    "task_config": [
+                                        {
+                                            "name": "min_level",
+                                            "label": "Minimum detection level",
+                                            "description": "Restrict loaded Sigma rules to this level or higher",
+                                            "type": "select",
+                                            "required": False,
+                                            "value": f"{chainsaw_min_level}",
+                                        }
+                                    ],
+                                    "type": "task",
+                                    "uuid": f"{chainsaw_hunt_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Chainsaw Sigma",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-chainsaw.tasks.builtin_only",
+                                    "queue_name": "openrelik-worker-chainsaw",
+                                    "display_name": "Chainsaw: Built-in rules only",
+                                    "description": "Chainsaw built-in rules (AV alerts, log-clearing) without Sigma",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{chainsaw_builtin_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Chainsaw Built-in",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-chainsaw.tasks.analyse_srum",
+                                    "queue_name": "openrelik-worker-chainsaw",
+                                    "display_name": "Chainsaw: Analyse SRUM database",
+                                    "description": "Parse SRUDB.dat (requires SOFTWARE hive in the same input set)",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{chainsaw_srum_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Chainsaw SRUM",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-plaso.tasks.log2timeline",
+                                    "queue_name": "openrelik-worker-plaso",
+                                    "display_name": "Plaso: Log2Timeline",
+                                    "description": "Super timelining",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{plaso_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Plaso",
+                                        )
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            }
+        )
+    }
+
+    return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
+
+
 def run_workflow(folder_id, workflow_id):
     """
     Trigger the workflow execution.
@@ -1223,6 +1423,57 @@ def api_hayabusa():
     return jsonify(
         {
             "message": "Hayabusa Workflow(s) started successfully",
+        }
+    )
+
+
+@app.route("/api/triage/timesketch", methods=["POST"])
+def api_triage_timesketch():
+    """
+    Catchall triage endpoint. Accepts a single archive (typically a
+    Velociraptor KAPE collection zip), extracts it, fans out in parallel
+    to every known analyser (Hayabusa, Chainsaw x3, Plaso), and uploads
+    each analyser's output to Timesketch as a separately named timeline
+    in the same sketch.
+
+    Each worker's compatible-input filter decides whether to process
+    the extracted files or no-op, so a single endpoint handles triage
+    zips regardless of the specific artefacts inside. No per-worker
+    hunts required in Velociraptor — one server-event artefact POSTs
+    to this endpoint and the rest is automatic.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    filename = file.filename
+    timeline_name, _extension = os.path.splitext(filename)
+    fqdn, _label = extract_fqdn_and_label(filename)
+
+    sketch_id = 1
+    timeline_name = fqdn if fqdn else timeline_name
+    sketch_name = ""
+
+    file_path = os.path.join("/tmp", filename)
+    file.save(file_path)
+
+    folder_id = create_folder(f"{filename} Triage")
+    file_id = upload_file(file_path, folder_id)
+    workflow_id, workflow_folder_id = create_workflow(folder_id, [file_id])
+
+    rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
+    rename_workflow(folder_id, workflow_id, f"{filename} Triage Workflow")
+
+    add_triage_ts_tasks_to_workflow(
+        folder_id, workflow_id, sketch_name, sketch_id, timeline_name
+    )
+    run = run_workflow(folder_id, workflow_id)
+
+    return jsonify(
+        {
+            "message": "Triage to Timesketch Workflow started successfully",
+            "workflow_id": workflow_id,
+            "run_details": run,
         }
     )
 
