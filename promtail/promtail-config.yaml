@@ -339,3 +339,24 @@ scrape_configs:
       - timestamp:
           source: ts
           format: RFC3339
+
+  # install.sh master log (free-form stdout/stderr of the whole install).
+  # Sits alongside install.audit.log — audit.log is the structured
+  # start/error/complete events used for alerting, this one is the
+  # complete human-readable trace for post-mortem debugging. Closes the
+  # "install.log not shipped" Phase 1 gap.
+  #
+  # Labels: source=case-install (same subsystem as the audit scrape),
+  # class=ops (vs audit so `{source="case-install", class="audit"}`
+  # stays narrow for alert rules; ops queries get the full raw log).
+  - job_name: case-install-raw
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: case-install-raw
+          host: case-__CASE_ID__
+          source: case-install
+          class: ops
+          case: '__CASE_ID__'
+          __path__: /opt/openrelik-pipeline/logs/install.log
