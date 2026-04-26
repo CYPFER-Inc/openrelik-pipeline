@@ -511,7 +511,12 @@ EOF
     # enabled. The openrelik-pipeline container logs in as admin/password via
     # timesketch-api-client; without this, Timesketch aborts with
     # "Local authentication is disabled for this user. Please use OAuth."
-    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin']|" "$TS_CONF"
+    #
+    # `ai-summary-worker@cypfer.local` is the Phase 3 AI service account
+    # (microcloud:llm/README.md §3). v1 uses local-password auth from the
+    # worker; Phase 7 will migrate to OIDC bearer via GOOGLE_OIDC_API_CLIENT_ID
+    # at which point this entry can be dropped.
+    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin', 'ai-summary-worker@cypfer.local']|" "$TS_CONF"
 
     # Restart Timesketch to pick up OIDC config. Also bounce nginx: it caches
     # the upstream container IP at startup, and when timesketch-web comes back
@@ -550,6 +555,30 @@ EOF
     } > "${TS_ROSTER_FILE}"
     chmod 600 "${TS_ROSTER_FILE}"
     echo "Seeded TS roster: ${TS_ROSTER_FILE}"
+
+    # ─── Phase 3: AI service account (microcloud:llm/README.md §3) ───────────
+    # Append the AI worker to the roster as a reader. Pre-create it with a
+    # known password BEFORE ts-apply.sh runs so the apply's "if not exists"
+    # branch doesn't fire (which would assign a random password we couldn't
+    # recover — tsctl has no reset-password primitive, and deleting+
+    # recreating would also wipe the sketch ACL grants).
+    #
+    # The password is preserved across re-runs by reading the existing
+    # /etc/vote-case-ai.env if present.
+    AI_TS_USER="ai-summary-worker@cypfer.local"
+    AI_ENV_FILE="/etc/vote-case-ai.env"
+    if [ -f "${AI_ENV_FILE}" ] && grep -q '^AI_TS_PASSWORD=' "${AI_ENV_FILE}"; then
+      AI_TS_PASSWORD="$(grep '^AI_TS_PASSWORD=' "${AI_ENV_FILE}" | cut -d= -f2- | tr -d '"')"
+      echo "  AI TS password: preserved from ${AI_ENV_FILE}"
+    else
+      AI_TS_PASSWORD="$(openssl rand -hex 32)"
+      echo "  AI TS password: generated"
+    fi
+    docker compose exec -T timesketch-web tsctl create-user \
+        "${AI_TS_USER}" --password "${AI_TS_PASSWORD}" 2>/dev/null \
+      || echo "  AI TS user already exists — keeping its existing password"
+    echo "${AI_TS_USER}=reader" >> "${TS_ROSTER_FILE}"
+    echo "Appended AI service account to TS roster"
 
     # Apply the roster — TS picks up DB changes live, no restart needed.
     # Roster applier needs the running timesketch-web container (restart above
@@ -635,6 +664,10 @@ if [ "${INSTALL_OR}" = "true" ]; then
     source /etc/vote-case.env
     if [ -n "${CASE_ID}" ]; then
       OR_URL="https://${CASE_ID}-or.dev.cypfer.io"
+      # TS public hostname follows the same per-case pattern (nginx routes
+      # 2078-ts.dev.cypfer.io to the case container's TS). Used by Phase 3
+      # AI worker creds in /etc/vote-case-ai.env later in the script.
+      TS_URL="https://${CASE_ID}-ts.dev.cypfer.io"
       echo "Configuring OpenRelik for case ${CASE_ID}..."
 
       # Update config.env and .env
@@ -703,6 +736,13 @@ if [ "${INSTALL_OR}" = "true" ]; then
         } > "${OR_ROSTER_FILE}"
         chmod 600 "${OR_ROSTER_FILE}"
         echo "Seeded OR roster: ${OR_ROSTER_FILE}"
+
+        # ─── Phase 3: AI service account (microcloud:llm/README.md §3) ─────
+        # Append the AI worker as a reader. or-apply.sh will create the OR
+        # user, the OR API key generation block below issues a long-lived
+        # JWT for it, and the result lands in /etc/vote-case-ai.env.
+        echo "ai-summary-worker@cypfer.local=reader" >> "${OR_ROSTER_FILE}"
+        echo "Appended AI service account to OR roster"
 
         # Append [auth.oidc] with an empty allowlist — or-apply.sh will rewrite
         # the allowlist line from the roster once OR is up.
@@ -899,6 +939,43 @@ psort.py --version || true
   echo "API key saved to config.env and .openrelik_api_key"
 
   export OPENRELIK_API_KEY
+
+  # ─── Phase 3: AI service account — OR API key + /etc/vote-case-ai.env ──────
+  # Generate a separate long-lived OR JWT for ai-summary-worker@cypfer.local
+  # (the AI account, NOT the pipeline's admin account). Mirrors the JWT-shape
+  # validation pattern above. The AI account was created earlier by
+  # or-apply.sh from the AI roster row appended in the OR roster block.
+  AI_OR_USER="ai-summary-worker@cypfer.local"
+  AI_OR_API_KEY="$(COLUMNS=1000 docker compose -f "${OR_COMPOSE}" exec -T openrelik-server python admin.py create-api-key "${AI_OR_USER}" --key-name "ai-worker" 2>/dev/null)"
+  AI_OR_API_KEY=$(echo "$AI_OR_API_KEY" | tr -d '[:cntrl:][:space:]')
+  if [ "${#AI_OR_API_KEY}" -lt 100 ] || ! echo "$AI_OR_API_KEY" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+    echo "WARNING: AI OR API key does not look like a JWT (len=${#AI_OR_API_KEY})"
+    echo "         AI worker (Phase 5) won't have OR access until this is fixed."
+    AI_OR_API_KEY=""
+  fi
+
+  # Write per-case AI credentials. AI_TS_PASSWORD comes from the TS roster
+  # block earlier in this script (preserved across re-runs). Phase 5 worker
+  # sources this file from the case container; v1 has no consumer yet.
+  AI_ENV_FILE="/etc/vote-case-ai.env"
+  cat > "${AI_ENV_FILE}" <<AIEOF
+# Per-case AI worker credentials — generated by openrelik-pipeline:install.sh
+# on $(date -u +%FT%TZ) for case ${CASE_ID:-unknown}. Phase 3 of the v1 AI
+# integration plan (microcloud:llm/README.md §3).
+#
+# v1 auth model:
+#   TS: HTTP Basic with AI_TS_USER + AI_TS_PASSWORD against AI_TS_URL
+#   OR: Authorization: Bearer ${AI_OR_API_KEY:0:8}... against AI_OR_URL
+# Phase 7 migrates TS to OIDC bearer; this file's TS_* fields will go away.
+AI_ACCOUNT="${AI_TS_USER}"
+AI_TS_URL="${TS_URL:-}"
+AI_TS_USER="${AI_TS_USER}"
+AI_TS_PASSWORD="${AI_TS_PASSWORD}"
+AI_OR_URL="${OR_URL:-}"
+AI_OR_API_KEY="${AI_OR_API_KEY}"
+AIEOF
+  chmod 600 "${AI_ENV_FILE}"
+  echo "Wrote AI worker credentials: ${AI_ENV_FILE} (chmod 600)"
 
   # Authenticate to GHCR for private image pulls
   if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
