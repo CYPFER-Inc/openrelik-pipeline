@@ -50,10 +50,12 @@ def create_folder(folder_name):
 
 # Default group + role granted read access when a new case folder is created
 # by /api/triage/timesketch?case_id=... . Exposed as env vars so the deployment
-# can tune without a code change if OpenRelik's role vocabulary differs from
-# the defaults below.
+# can tune without a code change. Valid OpenRelik roles per the API:
+# Owner, Editor, Viewer, No Access. The folder's creator (the pipeline's API
+# key user, typically admin) is Owner automatically; we only need to grant
+# read access to the rest of the team via Viewer.
 CASE_FOLDER_READ_GROUP = os.getenv("CASE_FOLDER_READ_GROUP", "Everyone")
-CASE_FOLDER_READ_ROLE = os.getenv("CASE_FOLDER_READ_ROLE", "Reader")
+CASE_FOLDER_READ_ROLE = os.getenv("CASE_FOLDER_READ_ROLE", "Viewer")
 
 
 def find_or_create_case_folder(case_id):
@@ -76,21 +78,29 @@ def find_or_create_case_folder(case_id):
     if new_id is None:
         return None
 
+    # share_folder prints to stdout and returns None on error rather than
+    # raising; treat None as failure so the warning gets logged correctly.
+    share_result = None
     try:
-        folders_api.share_folder(
+        share_result = folders_api.share_folder(
             new_id,
             group_names=[CASE_FOLDER_READ_GROUP],
             group_role=CASE_FOLDER_READ_ROLE,
         )
     except Exception as exc:
-        # Folder was created successfully — only the ACL grant failed.
-        # Log and continue so admin still sees the workflow land; they
-        # can fix the share from the UI or by rerunning with a corrected
-        # CASE_FOLDER_READ_ROLE env var.
         app.logger.warning(
-            "Case folder %s (id=%s) created but share to group %s with role %s failed: %s",
-            case_id, new_id, CASE_FOLDER_READ_GROUP, CASE_FOLDER_READ_ROLE, exc,
+            "Case folder %s (id=%s) created but share_folder raised: %s",
+            case_id, new_id, exc,
         )
+    else:
+        if share_result is None:
+            app.logger.warning(
+                "Case folder %s (id=%s) created but share to group %s with role %s "
+                "returned None (likely invalid role/group). Valid OpenRelik roles: "
+                "Owner, Editor, Viewer, No Access. Admin can share manually via the "
+                "OpenRelik UI, or set CASE_FOLDER_READ_ROLE env var.",
+                case_id, new_id, CASE_FOLDER_READ_GROUP, CASE_FOLDER_READ_ROLE,
+            )
 
     return new_id
 
@@ -1526,11 +1536,10 @@ def api_triage_timesketch():
     file_id = upload_file(file_path, folder_id)
     workflow_id, workflow_folder_id = create_workflow(folder_id, [file_id])
 
-    # In the legacy (no case_id) flow we rename the workflow's own folder
-    # to be analyst-friendly. In the case-folder flow we leave the workflow
-    # subfolder alone — the parent case folder is the navigation anchor.
-    if not case_id:
-        rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
+    # Always name the workflow's subfolder and the workflow itself. Skipping
+    # the folder rename in the case-folder flow left it showing as
+    # "Untitled Workflow" in the OpenRelik UI.
+    rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
     rename_workflow(folder_id, workflow_id, f"{filename} Triage Workflow")
 
     add_triage_ts_tasks_to_workflow(
