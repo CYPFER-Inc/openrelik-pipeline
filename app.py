@@ -1499,15 +1499,17 @@ def api_triage_timesketch():
     hunts required in Velociraptor — one server-event artefact POSTs
     to this endpoint and the rest is automatic.
 
-    Form parameters:
-      file     (required) — the archive to triage
-      case_id  (optional) — if provided, the triage workflow is created
-                            inside a top-level case folder named case_id
-                            (e.g. "Case-2077"). If that folder doesn't
-                            exist, it's created and granted read access
-                            for CASE_FOLDER_READ_GROUP. If case_id is
-                            omitted, the old behaviour is preserved: a
-                            fresh root folder per zip.
+    Parameters (form data and/or query string):
+      file     (required, multipart) — the archive to triage
+      case_id  (optional, form OR ?case_id=...) — if provided, the triage
+                            workflow is created inside a top-level case
+                            folder named case_id (e.g. "Case-2077"). If
+                            that folder doesn't exist, it's created and
+                            granted read access for CASE_FOLDER_READ_GROUP.
+                            If case_id is omitted, the old behaviour is
+                            preserved: a fresh root folder per zip.
+                            Query-string form is the canonical way to call
+                            this from Velociraptor's VQL http_client.
     """
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -1517,7 +1519,15 @@ def api_triage_timesketch():
     timeline_name, _extension = os.path.splitext(filename)
     fqdn, _label = extract_fqdn_and_label(filename)
 
-    case_id = (request.form.get("case_id") or "").strip()
+    # Accept case_id from form data (curl -F) OR query string (?case_id=...).
+    # Velociraptor's VQL http_client cleanly carries one multipart "files"
+    # entry but layering a non-file form field alongside is awkward; query
+    # string is the path of least resistance for VR callers.
+    case_id = (
+        request.form.get("case_id")
+        or request.args.get("case_id")
+        or ""
+    ).strip()
 
     sketch_id = 1
     timeline_name = fqdn if fqdn else timeline_name
