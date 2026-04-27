@@ -25,6 +25,8 @@ services:
 
       - TIMESKETCH_PASSWORD=YOUR_TS_PASSWORD
 
+      - CASE_ID=YOUR_CASE_ID
+
     volumes:
 
       - /opt/openrelik/data:/usr/share/openrelik/data
