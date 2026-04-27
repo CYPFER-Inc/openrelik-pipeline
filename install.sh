@@ -928,6 +928,18 @@ psort.py --version || true
   # value now, mirroring the YOUR_API_KEY pattern.
   sed -i "s#YOUR_TS_PASSWORD#${TIMESKETCH_PASSWORD}#g" /opt/openrelik-pipeline/docker-compose.yml
 
+  # Materialize CASE_ID. Sourced earlier from /etc/vote-case.env when the
+  # install runs in vote-managed per-case mode. On non-vote dev installs
+  # CASE_ID is empty and the placeholder is replaced with an empty string;
+  # the pipeline app then falls back to its legacy "fresh root folder per
+  # zip" behaviour for /api/triage/timesketch.
+  sed -i "s#YOUR_CASE_ID#${CASE_ID:-}#g" /opt/openrelik-pipeline/docker-compose.yml
+  if [ -n "${CASE_ID:-}" ]; then
+    echo "Pipeline CASE_ID baked into docker-compose: ${CASE_ID}"
+  else
+    echo "Pipeline CASE_ID empty (non-per-case install) -- legacy folder behaviour"
+  fi
+
   # Persist key to config.env and key file so configure container and rotation cron can use it
   if grep -q "^OPENRELIK_API_KEY=" /opt/openrelik-pipeline/config.env 2>/dev/null; then
     sed -i "s#^OPENRELIK_API_KEY=.*#OPENRELIK_API_KEY=${OPENRELIK_API_KEY}#" /opt/openrelik-pipeline/config.env
