@@ -604,9 +604,22 @@ if [ "${INSTALL_OR}" = "true" ]; then
   cd /opt
   curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
 
-  # Pre-pull OpenRelik images from local mirror before the deploy script runs
+  # Pre-pull OpenRelik images from the local mirror before the deploy script
+  # runs.  Two layers to warm:
+  #
+  #   1. TAGGED images that upstream openrelik-deploy/install.sh requests via
+  #      `docker compose pull`.  Those tags pre-date the generic OIDC module so
+  #      we will swap them for digests later -- but the tag-layer pull still
+  #      has to succeed first or upstream's install bails.
+  #
+  #   2. DIGEST-pinned images that pin_compose_image_digest rewrites compose to
+  #      use after the tagged install.  Without this loop, `docker compose
+  #      up -d` after pinning misses the mirror and falls back to the internet
+  #      on every install (slow + Geneve TLS flakes).  Digest list is sourced
+  #      directly from config.env so this stays in lock-step with what is
+  #      actually deployed.
   if [ -n "${REGISTRY_MIRROR:-}" ]; then
-    echo "Pre-pulling OpenRelik images from local mirror..."
+    echo "Pre-pulling OpenRelik images (tagged) from local mirror..."
     for img in \
       ghcr.io/openrelik/openrelik-server:0.7.0 \
       ghcr.io/openrelik/openrelik-ui:0.7.0 \
@@ -624,6 +637,34 @@ if [ "${INSTALL_OR}" = "true" ]; then
       echo "  Pulling ${MIRRORED}..."
       docker pull "${MIRRORED}" 2>/dev/null && \
         docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
+    done
+
+    echo "Pre-pulling OpenRelik images (digest-pinned) from local mirror..."
+    # Base-image map for every digest var that may be pinned in config.env.
+    # Mirrors the IMAGE_MAP in .github/workflows/scan-images.yml -- keep the
+    # two in sync when adding a new digest pin.
+    declare -A DIGEST_IMAGE_MAP=(
+      ["OPENRELIK_SERVER_DIGEST"]="ghcr.io/openrelik/openrelik-server"
+      ["OPENRELIK_UI_DIGEST"]="ghcr.io/openrelik/openrelik-ui"
+      ["OPENRELIK_MEDIATOR_DIGEST"]="ghcr.io/openrelik/openrelik-mediator"
+      ["OPENRELIK_WORKER_PLASO_DIGEST"]="ghcr.io/openrelik/openrelik-worker-plaso"
+      ["OPENRELIK_WORKER_TIMESKETCH_DIGEST"]="ghcr.io/openrelik/openrelik-worker-timesketch"
+      ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction"
+      ["OPENRELIK_WORKER_STRINGS_DIGEST"]="ghcr.io/openrelik/openrelik-worker-strings"
+      ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep"
+      ["REDIS_DIGEST"]="redis"
+      ["POSTGRES_DIGEST"]="postgres"
+    )
+    for var in "${!DIGEST_IMAGE_MAP[@]}"; do
+      digest="${!var:-}"
+      base="${DIGEST_IMAGE_MAP[$var]}"
+      [ -z "${digest}" ] && continue
+      ref="${base}@${digest}"
+      MIRRORED=$(mirror_image "${ref}")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null \
+        && docker tag "${MIRRORED}" "${ref}" 2>/dev/null \
+        || echo "    WARN: digest pre-pull failed for ${var} (${ref}) -- first install will fall back to internet"
     done
   fi
 
