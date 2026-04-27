@@ -31,7 +31,11 @@ workflows_api = WorkflowsAPI(api_client)
 # Initialize Flask app
 # --------------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10GB limit
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024 * 1024  # 50 GB limit
+# Upper bound chosen for the NETWORK_ pipeline (large firewall / VPC flow
+# logs can run multi-GB). HOST_ triage zips are typically much smaller.
+# Werkzeug enforces this globally for all routes; per-endpoint enforcement
+# is up to each handler if it wants a tighter cap.
 ts_client = timesketch_client.TimesketchApi(
     host_uri=TIMESKETCH_URL, username="admin", password=TIMESKETCH_PASSWORD
 )
@@ -1314,6 +1318,84 @@ def add_triage_ts_tasks_to_workflow(
     return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
 
 
+def add_network_ts_tasks_to_workflow(
+    folder_id,
+    workflow_id,
+    sketch_name,
+    sketch_id,
+    timeline_name,
+):
+    """
+    NETWORK_ ingestion workflow: Extract → network-normalizer → Timesketch.
+
+    Layout:
+
+        extract_archive
+          └── openrelik-worker-network-normalizer.normalize
+                └── timesketch upload (timeline: "<base> - Network")
+
+    Single-branch DAG by design — the normalizer worker hosts every
+    supported log format internally (Logstash configs from SOF-ELK), so
+    fan-out happens inside the worker rather than at the workflow layer.
+    Per-format Logstash configs are added in the network-normalizer
+    repo's NET-7 / NET-8 / NET-9 / NET-11 / NET-12 / NET-13 / NET-14
+    PRs.
+
+    Until at least one format is enabled, calling this endpoint will
+    create a workflow that completes extraction but stalls at
+    network_normalize (no Celery consumer for that task name yet). This
+    is by design for staged delivery -- the route lands in NET-2,
+    formats land progressively, and end-to-end success requires both.
+    """
+    extraction_uuid = str(uuid.uuid4()).replace("-", "")
+    normalize_uuid = str(uuid.uuid4()).replace("-", "")
+
+    workflow_spec = {
+        "spec_json": json.dumps(
+            {
+                "workflow": {
+                    "type": "chain",
+                    "isRoot": True,
+                    "tasks": [
+                        {
+                            "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                            "queue_name": "openrelik-worker-extraction",
+                            "display_name": "Extract Archives",
+                            "description": "Extract files from archive for the network normalizer",
+                            "task_config": [],
+                            "type": "task",
+                            "uuid": f"{extraction_uuid}",
+                            "tasks": [
+                                {
+                                    "task_name": "openrelik-worker-network-normalizer.tasks.normalize",
+                                    "queue_name": "openrelik-worker-network-normalizer",
+                                    "display_name": "Network: Normalize to ECS",
+                                    "description": (
+                                        "Run extracted log files through SOF-ELK Logstash "
+                                        "configs; emit ECS-shaped Timesketch JSONL"
+                                    ),
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{normalize_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Network",
+                                        )
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            }
+        )
+    }
+
+    return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
+
+
 def run_workflow(folder_id, workflow_id):
     """
     Trigger the workflow execution.
@@ -1570,6 +1652,88 @@ def api_triage_timesketch():
     return jsonify(
         {
             "message": "Triage to Timesketch Workflow started successfully",
+            "case_id": case_id or None,
+            "case_folder_id": folder_id if case_id else None,
+            "workflow_id": workflow_id,
+            "run_details": run,
+        }
+    )
+
+
+@app.route("/api/network/timesketch", methods=["POST"])
+def api_network_timesketch():
+    """
+    Network-log ingestion endpoint. Sibling of /api/triage/timesketch
+    but feeds the openrelik-worker-network-normalizer worker (Logstash +
+    SOF-ELK) instead of the per-tool host analyser fan-out.
+
+    Use this for vendor network logs:
+      * Firewall (Palo Alto, Fortinet, Cisco ASA, ...)
+      * IDS/Network monitoring (Zeek, Suricata)
+      * Cloud audit (CloudTrail, Entra sign-in, Azure NSG, GWS, Okta)
+      * EDR (CrowdStrike, SentinelOne, Defender)
+      * pcap (passes through openrelik-worker-zeek first, future)
+
+    Outputs land in the same case sketch as the HOST_ pipeline so
+    analysts can pivot across both via shared ECS fields.
+
+    Parameters mirror /api/triage/timesketch:
+      file     (required, multipart) — log file or archive
+      case_id  (optional) — same resolution order as the triage route:
+                              1. form data (curl -F "case_id=...")
+                              2. query string (?case_id=...)
+                              3. CASE_ID env var on the pipeline container
+                            If omitted everywhere, falls back to a fresh
+                            root folder per upload.
+
+    Status: NET-2 ships the route + workflow construction. End-to-end
+    parsing requires at least one format-specific Logstash config in the
+    network-normalizer worker (NET-7 onwards). Until then, calling this
+    endpoint creates a workflow that completes extraction but stalls at
+    network_normalize. This is by design for staged delivery.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    filename = file.filename
+    timeline_name, _extension = os.path.splitext(filename)
+    fqdn, _label = extract_fqdn_and_label(filename)
+
+    case_id = (
+        request.form.get("case_id")
+        or request.args.get("case_id")
+        or os.getenv("CASE_ID", "")
+    ).strip()
+
+    sketch_id = 1
+    timeline_name = fqdn if fqdn else timeline_name
+    sketch_name = ""
+
+    file_path = os.path.join("/tmp", filename)
+    file.save(file_path)
+
+    if case_id:
+        folder_id = find_or_create_case_folder(case_id)
+        if folder_id is None:
+            return jsonify({"error": f"Failed to find or create case folder {case_id!r}"}), 500
+    else:
+        folder_id = create_folder(f"{filename} Network")
+
+    file_id = upload_file(file_path, folder_id)
+    workflow_id, workflow_folder_id = create_workflow(folder_id, [file_id])
+
+    rename_folder(workflow_folder_id, f"{filename} Network Workflow Folder")
+    rename_workflow(folder_id, workflow_id, f"{filename} Network Workflow")
+
+    add_network_ts_tasks_to_workflow(
+        folder_id, workflow_id, sketch_name, sketch_id, timeline_name
+    )
+    run = run_workflow(folder_id, workflow_id)
+
+    return jsonify(
+        {
+            "message": "Network to Timesketch Workflow started successfully",
             "case_id": case_id or None,
             "case_folder_id": folder_id if case_id else None,
             "workflow_id": workflow_id,
