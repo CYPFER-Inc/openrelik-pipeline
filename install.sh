@@ -1133,6 +1133,43 @@ AIEOF
     exit 1
   fi
 
+  # ─── Inject openrelik-worker-network-normalizer ───────────────────────────
+  # Same shape as the timesketch-worker block above. Powers the NETWORK_
+  # ingestion pipeline (/api/network/timesketch in app.py + the
+  # CYPFER.Network.Normalize.Timesketch workflow template). Without this
+  # block, every network-normalize task silently queues forever — same
+  # failure mode case-2073 surfaced for the timesketch worker.
+  #
+  # Re-grep for ^volumes: because the timesketch injection above pushed it
+  # down by ~13 lines.
+  echo "Injecting openrelik-worker-network-normalizer into ${OR_COMPOSE}..."
+  line=$(grep -n "^volumes:" "${OR_COMPOSE}" | head -n1 | cut -d: -f1)
+  if [ -z "${line}" ]; then
+    echo "ERROR: no 'volumes:' anchor in ${OR_COMPOSE} — cannot inject openrelik-worker-network-normalizer"
+    exit 1
+  fi
+  insert_line=$((line - 1))
+
+  NETWORK_NORMALIZER_VERSION="${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}"
+
+  sed -i "${insert_line}i\\
+  \\
+  openrelik-worker-network-normalizer:\\
+      container_name: openrelik-worker-network-normalizer\\
+      image: ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${NETWORK_NORMALIZER_VERSION}\\
+      restart: always\\
+      environment:\\
+        - REDIS_URL=redis://openrelik-redis:6379\\
+      volumes:\\
+        - ./data:/usr/share/openrelik/data\\
+      command: \"celery --app=src.app worker --task-events --concurrency=2 --loglevel=INFO -Q openrelik-worker-network-normalizer\"
+" "${OR_COMPOSE}"
+
+  if ! grep -q "openrelik-worker-network-normalizer:" "${OR_COMPOSE}"; then
+    echo "ERROR: openrelik-worker-network-normalizer block was not injected into ${OR_COMPOSE}"
+    exit 1
+  fi
+
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
     docker network connect openrelik_default timesketch-web 2>/dev/null \
@@ -1171,6 +1208,16 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-timesketch failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-timesketch"
+  fi
+
+  # Start the network-normalizer worker (NETWORK_ pipeline)
+  docker compose up -d openrelik-worker-network-normalizer 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-network-normalizer"; then
+    echo "openrelik-worker-network-normalizer is running"
+  else
+    echo "WARNING: openrelik-worker-network-normalizer failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-network-normalizer"
   fi
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
