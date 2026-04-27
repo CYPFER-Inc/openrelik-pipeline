@@ -1132,6 +1132,38 @@ AIEOF
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-timesketch"
   fi
 
+  # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
+  # configure.py adds the worker's compose block to docker-compose.yml from
+  # the openrelik-or-config image; we still need an explicit `up -d` to
+  # actually create the container. Source /etc/vote-case-ai.env first so
+  # the AI_* env vars (Phase 3 install block) are available for compose
+  # interpolation in workers/openrelik-worker-llm-summary.yml.
+  #
+  # If the env file is absent, the worker still comes up but with empty
+  # AI_* vars — the worker fails fast with a clear error message on first
+  # task (see _required_env in src/summarise_timeline.py).
+  if grep -q "openrelik-worker-llm-summary" /opt/openrelik/docker-compose.yml 2>/dev/null; then
+    AI_ENV_FILE="/etc/vote-case-ai.env"
+    if [ -r "${AI_ENV_FILE}" ]; then
+      set -a
+      # shellcheck disable=SC1090
+      . "${AI_ENV_FILE}"
+      set +a
+      echo "Sourced AI worker creds from ${AI_ENV_FILE} for compose interpolation"
+    else
+      echo "WARNING: ${AI_ENV_FILE} not found — openrelik-worker-llm-summary will start with empty AI_* env"
+      echo "         Worker fails fast on first task; no AI work happens until creds are populated."
+    fi
+    docker compose up -d openrelik-worker-llm-summary 2>/dev/null
+
+    if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-llm-summary"; then
+      echo "openrelik-worker-llm-summary is running"
+    else
+      echo "WARNING: openrelik-worker-llm-summary failed to start"
+      echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-llm-summary"
+    fi
+  fi
+
   echo "OpenRelik deployment complete"
 fi
 

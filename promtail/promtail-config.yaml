@@ -272,6 +272,72 @@ scrape_configs:
           action: event
           verdict: verdict_static
 
+  # AI summary worker audit events (Phase 2/5). The vendored cypfer_ai_audit
+  # library (src/audit.py in openrelik-worker-llm-summary) emits one
+  # AUDIT-prefixed JSON line per ai_prompt and ai_response event. Shape:
+  #
+  #   AUDIT {"ts":"…","event":"ai_prompt","actor":"ai-summary-worker",
+  #          "caseid":"2079","verdict":"ok","model":"…","template":"summary.v1",
+  #          "input_tokens":1843,"prompt_sha256":"…","run_id":"…"}
+  #   AUDIT {"ts":"…","event":"ai_response","actor":"ai-summary-worker",
+  #          "caseid":"2079","verdict":"ok|refused|error","run_id":"…",
+  #          "duration_ms":8420,"refusal":false,"output_tokens":412,
+  #          "response_sha256":"…"}
+  #
+  # Hashes (not full content) keep audit volume bounded — full prompt +
+  # response are stored as OR workflow artifacts and discoverable by
+  # sha256 from the audit stream. See microcloud:llm/README.md §7.
+  - job_name: openrelik-worker-llm-summary-audit
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: name
+            values: [openrelik-worker-llm-summary]
+    relabel_configs:
+      - target_label: 'job'
+        replacement: 'openrelik-worker-llm-summary-audit'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'ai-summary-worker'
+      - target_label: 'class'
+        replacement: 'audit'
+    pipeline_stages:
+      # Keep only AUDIT-prefixed lines; the worker's ops logs (Celery
+      # startup banner, task-progress events) fall through and would be
+      # ops-class, not audit. Drop them at ingest so audit queries stay
+      # clean.
+      - regex:
+          expression: '^AUDIT (?P<audit_json>\{.*\})\s*$'
+      - template:
+          source: audit_json
+          template: '{{ default "" .audit_json }}'
+      - drop:
+          source: audit_json
+          expression: '^$'
+          drop_counter_reason: non_audit_line
+      - json:
+          source: audit_json
+          expressions:
+            ts: ts
+            event: event
+            actor: actor
+            verdict: verdict
+            refusal: refusal
+      # Promote to unified-schema labels. action = event ("ai_prompt"
+      # or "ai_response"). refusal stays in the body — Grafana refusal-
+      # rate panels query it via `| json | refusal="true"`.
+      - timestamp:
+          source: ts
+          format: RFC3339
+      - labels:
+          actor:
+          action: event
+          verdict:
+
   # install.sh structured audit trail (install-start, install-error,
   # install-complete). Emitted by emit_install_audit() in install.sh as
   # JSON-per-line into /opt/openrelik-pipeline/logs/install.audit.log.
