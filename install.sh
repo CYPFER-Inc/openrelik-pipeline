@@ -600,6 +600,13 @@ EOF
     # tsctl shell is needed because the User model's relationship() to
     # Sketch requires the full Flask app context — raw `python3 -c` errors
     # with KeyError: 'Sketch'.
+    #
+    # cd /opt/timesketch is REQUIRED — `docker compose` needs to find the
+    # compose file. Without it, both this exec and the restart below
+    # silently fail with "no configuration file provided: not found",
+    # leaving the AI user with ts-apply.sh's random password and the env
+    # file's password disagreeing. Observed on case-2093.
+    cd /opt/timesketch
     AI_TS_USER="${AI_TS_USER}" AI_TS_PASSWORD="${AI_TS_PASSWORD}" \
       docker compose exec -T -e AI_TS_USER -e AI_TS_PASSWORD \
         timesketch-web tsctl shell <<'PYSHELL'
@@ -619,6 +626,7 @@ PYSHELL
     # check_password returns True. Confirmed needed during case-2088 manual
     # recovery.
     docker compose restart timesketch-web
+    cd /opt
 
     echo "Timesketch OIDC configured"
   elif [ "${ENVIRONMENT}" = "prod" ]; then
@@ -1254,27 +1262,40 @@ AIEOF
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
   # configure.py adds the worker's compose block to docker-compose.yml from
-  # the openrelik-or-config image; we still need an explicit `up -d` to
-  # actually create the container. Source /etc/vote-case-ai.env first so
-  # the AI_* env vars (Phase 3 install block) are available for compose
-  # interpolation in workers/openrelik-worker-llm-summary.yml.
+  # the openrelik-or-config image AND eagerly starts the container with no
+  # AI_* env vars set — `docker compose up -d` here would be a no-op (the
+  # container already exists; compose only recreates if the file changed,
+  # which it didn't from compose's perspective even though the SHELL env
+  # changed). Use --force-recreate so the AI_* vars sourced below actually
+  # land in the running container.
   #
-  # If the env file is absent, the worker still comes up but with empty
-  # AI_* vars — the worker fails fast with a clear error message on first
-  # task (see _required_env in src/summarise_timeline.py).
+  # The worker env splits across two files by ownership domain:
+  #   /etc/vote-case-ai.env   — TS + OR creds, written by THIS install.sh
+  #                             Phase 3 block from case-local tsctl /
+  #                             admin.py outputs.
+  #   /etc/vote-case-llm.env  — LiteLLM URL + per-case virtual key, written
+  #                             by microcloud:scripts/vote.sh during
+  #                             `vote launch` (master-key call against the
+  #                             services-1 LiteLLM proxy lives on the MC
+  #                             initiator, never inside the case container).
+  # Source both before the recreate so the compose snippet from
+  # openrelik-or-config:workers/openrelik-worker-llm-summary.yml interpolates
+  # the full AI_* set. Absent files warned but non-fatal — the worker's
+  # _required_env still fails fast on first task with a clear error if
+  # anything's missing.
   if grep -q "openrelik-worker-llm-summary" /opt/openrelik/docker-compose.yml 2>/dev/null; then
-    AI_ENV_FILE="/etc/vote-case-ai.env"
-    if [ -r "${AI_ENV_FILE}" ]; then
-      set -a
-      # shellcheck disable=SC1090
-      . "${AI_ENV_FILE}"
-      set +a
-      echo "Sourced AI worker creds from ${AI_ENV_FILE} for compose interpolation"
-    else
-      echo "WARNING: ${AI_ENV_FILE} not found — openrelik-worker-llm-summary will start with empty AI_* env"
-      echo "         Worker fails fast on first task; no AI work happens until creds are populated."
-    fi
-    docker compose up -d openrelik-worker-llm-summary 2>/dev/null
+    for env_file in /etc/vote-case-ai.env /etc/vote-case-llm.env; do
+      if [ -r "${env_file}" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "${env_file}"
+        set +a
+        echo "Sourced AI worker creds from ${env_file} for compose interpolation"
+      else
+        echo "WARNING: ${env_file} not found — some AI_* env vars will be empty"
+      fi
+    done
+    docker compose up -d --force-recreate openrelik-worker-llm-summary 2>/dev/null
 
     if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-llm-summary"; then
       echo "openrelik-worker-llm-summary is running"
