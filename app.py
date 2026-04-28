@@ -1318,37 +1318,99 @@ def add_triage_ts_tasks_to_workflow(
     return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
 
 
+# Archive extensions handled by openrelik-worker-extraction's
+# extract_archive_task (7zip + tar). Anything outside this set is
+# treated as a plain log and bypasses extraction entirely — feeding a
+# bare .log into the extraction worker raises
+# RuntimeError("7zip or tar execution error.") because neither tool
+# recognises it as an archive.
+_NETWORK_ARCHIVE_SUFFIXES = (
+    ".zip", ".7z", ".rar",
+    ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+    ".gz", ".bz2", ".xz",
+)
+
+
+def _is_network_archive(filename):
+    """True if `filename` looks like an archive that the extraction
+    worker can unpack. Plain logs (.log, .txt, .syslog, .json, .csv,
+    .ndjson, no-extension) return False so the network workflow skips
+    extract_archive and feeds the file straight into the normalizer.
+    """
+    name = (filename or "").lower()
+    return any(name.endswith(suf) for suf in _NETWORK_ARCHIVE_SUFFIXES)
+
+
 def add_network_ts_tasks_to_workflow(
     folder_id,
     workflow_id,
     sketch_name,
     sketch_id,
     timeline_name,
+    is_archive=False,
 ):
     """
-    NETWORK_ ingestion workflow: Extract → network-normalizer → Timesketch.
+    NETWORK_ ingestion workflow.
 
-    Layout:
+    Two layouts depending on input shape:
 
-        extract_archive
-          └── openrelik-worker-network-normalizer.normalize
-                └── timesketch upload (timeline: "<base> - Network")
+        is_archive=True  (.zip / .tar.gz / .7z / ...):
+            extract_archive
+              └── openrelik-worker-network-normalizer.normalize
+                    └── timesketch upload (timeline: "<base> - Network")
 
-    Single-branch DAG by design — the normalizer worker hosts every
+        is_archive=False (.log / .txt / .syslog / .json / ...):
+            openrelik-worker-network-normalizer.normalize
+              └── timesketch upload (timeline: "<base> - Network")
+
+    The plain-input branch skips extract_archive because the extraction
+    worker invokes 7zip then tar and raises on non-archive input
+    ("7zip or tar execution error."). Network logs commonly arrive
+    bare (an analyst pulls a single .log off a firewall appliance) and
+    only sometimes as a multi-file archive from a SIEM/syslog server
+    export — both shapes need to flow through the same endpoint.
+
+    Single-branch DAG by design: the normalizer worker hosts every
     supported log format internally (Logstash configs from SOF-ELK), so
     fan-out happens inside the worker rather than at the workflow layer.
     Per-format Logstash configs are added in the network-normalizer
     repo's NET-7 / NET-8 / NET-9 / NET-11 / NET-12 / NET-13 / NET-14
     PRs.
-
-    Until at least one format is enabled, calling this endpoint will
-    create a workflow that completes extraction but stalls at
-    network_normalize (no Celery consumer for that task name yet). This
-    is by design for staged delivery -- the route lands in NET-2,
-    formats land progressively, and end-to-end success requires both.
     """
-    extraction_uuid = str(uuid.uuid4()).replace("-", "")
     normalize_uuid = str(uuid.uuid4()).replace("-", "")
+
+    normalize_task = {
+        "task_name": "openrelik-worker-network-normalizer.tasks.normalize",
+        "queue_name": "openrelik-worker-network-normalizer",
+        "display_name": "Network: Normalize to ECS",
+        "description": (
+            "Run network log files through SOF-ELK Logstash configs; "
+            "emit ECS-shaped Timesketch JSONL"
+        ),
+        "task_config": [],
+        "type": "task",
+        "uuid": f"{normalize_uuid}",
+        "tasks": [
+            _ts_leaf(sketch_name, sketch_id, f"{timeline_name} - Network")
+        ],
+    }
+
+    if is_archive:
+        extraction_uuid = str(uuid.uuid4()).replace("-", "")
+        root_tasks = [
+            {
+                "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                "queue_name": "openrelik-worker-extraction",
+                "display_name": "Extract Archives",
+                "description": "Extract files from archive for the network normalizer",
+                "task_config": [],
+                "type": "task",
+                "uuid": f"{extraction_uuid}",
+                "tasks": [normalize_task],
+            }
+        ]
+    else:
+        root_tasks = [normalize_task]
 
     workflow_spec = {
         "spec_json": json.dumps(
@@ -1356,38 +1418,7 @@ def add_network_ts_tasks_to_workflow(
                 "workflow": {
                     "type": "chain",
                     "isRoot": True,
-                    "tasks": [
-                        {
-                            "task_name": "openrelik-worker-extraction.tasks.extract_archive",
-                            "queue_name": "openrelik-worker-extraction",
-                            "display_name": "Extract Archives",
-                            "description": "Extract files from archive for the network normalizer",
-                            "task_config": [],
-                            "type": "task",
-                            "uuid": f"{extraction_uuid}",
-                            "tasks": [
-                                {
-                                    "task_name": "openrelik-worker-network-normalizer.tasks.normalize",
-                                    "queue_name": "openrelik-worker-network-normalizer",
-                                    "display_name": "Network: Normalize to ECS",
-                                    "description": (
-                                        "Run extracted log files through SOF-ELK Logstash "
-                                        "configs; emit ECS-shaped Timesketch JSONL"
-                                    ),
-                                    "task_config": [],
-                                    "type": "task",
-                                    "uuid": f"{normalize_uuid}",
-                                    "tasks": [
-                                        _ts_leaf(
-                                            sketch_name,
-                                            sketch_id,
-                                            f"{timeline_name} - Network",
-                                        )
-                                    ],
-                                }
-                            ],
-                        }
-                    ],
+                    "tasks": root_tasks,
                 }
             }
         )
@@ -1726,8 +1757,10 @@ def api_network_timesketch():
     rename_folder(workflow_folder_id, f"{filename} Network Workflow Folder")
     rename_workflow(folder_id, workflow_id, f"{filename} Network Workflow")
 
+    is_archive = _is_network_archive(filename)
     add_network_ts_tasks_to_workflow(
-        folder_id, workflow_id, sketch_name, sketch_id, timeline_name
+        folder_id, workflow_id, sketch_name, sketch_id, timeline_name,
+        is_archive=is_archive,
     )
     run = run_workflow(folder_id, workflow_id)
 
@@ -1737,6 +1770,7 @@ def api_network_timesketch():
             "case_id": case_id or None,
             "case_folder_id": folder_id if case_id else None,
             "workflow_id": workflow_id,
+            "extracted": is_archive,
             "run_details": run,
         }
     )
