@@ -1330,7 +1330,11 @@ AIEOF
   # _required_env still fails fast on first task with a clear error if
   # anything's missing.
   if grep -q "openrelik-worker-llm-summary" /opt/openrelik/docker-compose.yml 2>/dev/null; then
-    for env_file in /etc/vote-case-ai.env /etc/vote-case-llm.env; do
+    # /etc/vote-case.env contributes CASE_ID — without it the worker
+    # comes up with empty CASE_ID and every audit event gets misattributed
+    # (caught on case-2094). Order matters: case.env first so CASE_ID is
+    # available when ai.env / llm.env are sourced (in case any references it).
+    for env_file in /etc/vote-case.env /etc/vote-case-ai.env /etc/vote-case-llm.env; do
       if [ -r "${env_file}" ]; then
         set -a
         # shellcheck disable=SC1090
