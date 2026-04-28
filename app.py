@@ -31,7 +31,11 @@ workflows_api = WorkflowsAPI(api_client)
 # Initialize Flask app
 # --------------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 * 1024  # 10GB limit
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024 * 1024  # 50 GB limit
+# Upper bound chosen for the NETWORK_ pipeline (large firewall / VPC flow
+# logs can run multi-GB). HOST_ triage zips are typically much smaller.
+# Werkzeug enforces this globally for all routes; per-endpoint enforcement
+# is up to each handler if it wants a tighter cap.
 ts_client = timesketch_client.TimesketchApi(
     host_uri=TIMESKETCH_URL, username="admin", password=TIMESKETCH_PASSWORD
 )
@@ -46,6 +50,63 @@ def create_folder(folder_name):
     """
     response = folders_api.create_root_folder(folder_name)
     return response
+
+
+# Default group + role granted read access when a new case folder is created
+# by /api/triage/timesketch?case_id=... . Exposed as env vars so the deployment
+# can tune without a code change. Valid OpenRelik roles per the API:
+# Owner, Editor, Viewer, No Access. The folder's creator (the pipeline's API
+# key user, typically admin) is Owner automatically; we only need to grant
+# read access to the rest of the team via Viewer.
+CASE_FOLDER_READ_GROUP = os.getenv("CASE_FOLDER_READ_GROUP", "Everyone")
+CASE_FOLDER_READ_ROLE = os.getenv("CASE_FOLDER_READ_ROLE", "Viewer")
+
+
+def find_or_create_case_folder(case_id):
+    """
+    Return the folder_id of a top-level folder named case_id.
+
+    If no such folder exists, create it as a root folder and grant the
+    configured group (default: Everyone) read access. On reuse, permissions
+    are left as-is — if an admin has since hand-tuned the ACL in the UI,
+    we don't re-flatten it on every POST.
+
+    Returns the folder_id, or None if creation failed.
+    """
+    roots = folders_api.list_root_folders(1000) or []
+    for f in roots:
+        if f.get("display_name") == case_id:
+            return f["id"]
+
+    new_id = folders_api.create_root_folder(case_id)
+    if new_id is None:
+        return None
+
+    # share_folder prints to stdout and returns None on error rather than
+    # raising; treat None as failure so the warning gets logged correctly.
+    share_result = None
+    try:
+        share_result = folders_api.share_folder(
+            new_id,
+            group_names=[CASE_FOLDER_READ_GROUP],
+            group_role=CASE_FOLDER_READ_ROLE,
+        )
+    except Exception as exc:
+        app.logger.warning(
+            "Case folder %s (id=%s) created but share_folder raised: %s",
+            case_id, new_id, exc,
+        )
+    else:
+        if share_result is None:
+            app.logger.warning(
+                "Case folder %s (id=%s) created but share to group %s with role %s "
+                "returned None (likely invalid role/group). Valid OpenRelik roles: "
+                "Owner, Editor, Viewer, No Access. Admin can share manually via the "
+                "OpenRelik UI, or set CASE_FOLDER_READ_ROLE env var.",
+                case_id, new_id, CASE_FOLDER_READ_GROUP, CASE_FOLDER_READ_ROLE,
+            )
+
+    return new_id
 
 
 def upload_file(file_path, folder_id):
@@ -1057,6 +1118,315 @@ def add_hayabusa_extract_ts_tasks_to_workflow(folder_id, workflow_id, sketch_nam
     return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
 
 
+def _ts_task_config(sketch_name, sketch_id, timeline_name):
+    """Build a Timesketch-upload task_config list, preferring sketch_id over sketch_name."""
+    base = [
+        {
+            "name": "timeline_name",
+            "label": "Name of the timeline to create",
+            "description": "Timeline name",
+            "type": "text",
+            "required": False,
+            "value": f"{timeline_name}",
+        }
+    ]
+    if sketch_id != "":
+        return [
+            {
+                "name": "sketch_id",
+                "label": "Add to existing sketch",
+                "description": "Add to existing sketch",
+                "type": "text",
+                "required": False,
+                "value": f"{sketch_id}",
+            },
+            *base,
+        ]
+    return [
+        {
+            "name": "sketch_name",
+            "label": "Create a new sketch",
+            "description": "Create a new sketch",
+            "type": "text",
+            "required": False,
+            "value": f"{sketch_name}",
+        },
+        *base,
+    ]
+
+
+def _ts_leaf(sketch_name, sketch_id, timeline_name):
+    """Return a Timesketch-upload task dict suitable for use as a leaf node in a workflow tree."""
+    return {
+        "task_name": "openrelik-worker-timesketch.tasks.upload",
+        "queue_name": "openrelik-worker-timesketch",
+        "display_name": "Upload to Timesketch",
+        "description": "Upload resulting file to Timesketch",
+        "task_config": _ts_task_config(sketch_name, sketch_id, timeline_name),
+        "type": "task",
+        "uuid": str(uuid.uuid4()).replace("-", ""),
+        "tasks": [],
+    }
+
+
+def add_triage_ts_tasks_to_workflow(
+    folder_id,
+    workflow_id,
+    sketch_name,
+    sketch_id,
+    timeline_name,
+    chainsaw_min_level="high",
+):
+    """
+    Catchall triage workflow: Extract → fan out to every known analyser → each
+    branch uploads its own timeline to Timesketch.
+
+    Layout:
+
+        extract_archive
+          ├── hayabusa csv_timeline        → ts (timeline: "<base> - Hayabusa")
+          ├── chainsaw hunt_evtx           → ts (timeline: "<base> - Chainsaw Sigma")
+          ├── chainsaw builtin_only        → ts (timeline: "<base> - Chainsaw Built-in")
+          ├── chainsaw analyse_srum        → ts (timeline: "<base> - Chainsaw SRUM")
+          └── plaso log2timeline           → ts (timeline: "<base> - Plaso")
+
+    Each worker's compatible-input filter picks up only what it knows and
+    silently no-ops on everything else — there is no pre-classification step.
+    All five branches run in parallel once extraction completes; each writes
+    a separately named timeline into the same sketch (via sketch_id).
+    """
+    extraction_uuid = str(uuid.uuid4()).replace("-", "")
+    hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
+    chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
+    chainsaw_builtin_uuid = str(uuid.uuid4()).replace("-", "")
+    chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
+    plaso_uuid = str(uuid.uuid4()).replace("-", "")
+
+    workflow_spec = {
+        "spec_json": json.dumps(
+            {
+                "workflow": {
+                    "type": "chain",
+                    "isRoot": True,
+                    "tasks": [
+                        {
+                            "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                            "queue_name": "openrelik-worker-extraction",
+                            "display_name": "Extract Archives",
+                            "description": "Extract files from archive for downstream analysers",
+                            "task_config": [],
+                            "type": "task",
+                            "uuid": f"{extraction_uuid}",
+                            "tasks": [
+                                {
+                                    "task_name": "openrelik-worker-hayabusa.tasks.csv_timeline",
+                                    "queue_name": "openrelik-worker-hayabusa",
+                                    "display_name": "Hayabusa CSV timeline",
+                                    "description": "Windows event log triage",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{hayabusa_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Hayabusa",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-chainsaw.tasks.hunt_evtx",
+                                    "queue_name": "openrelik-worker-chainsaw",
+                                    "display_name": "Chainsaw: Hunt EVTX (Sigma + built-ins)",
+                                    "description": "Run SigmaHQ + Chainsaw built-in rules against EVTX",
+                                    "task_config": [
+                                        {
+                                            "name": "min_level",
+                                            "label": "Minimum detection level",
+                                            "description": "Restrict loaded Sigma rules to this level or higher",
+                                            "type": "select",
+                                            "required": False,
+                                            "value": f"{chainsaw_min_level}",
+                                        }
+                                    ],
+                                    "type": "task",
+                                    "uuid": f"{chainsaw_hunt_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Chainsaw Sigma",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-chainsaw.tasks.builtin_only",
+                                    "queue_name": "openrelik-worker-chainsaw",
+                                    "display_name": "Chainsaw: Built-in rules only",
+                                    "description": "Chainsaw built-in rules (AV alerts, log-clearing) without Sigma",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{chainsaw_builtin_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Chainsaw Built-in",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-chainsaw.tasks.analyse_srum",
+                                    "queue_name": "openrelik-worker-chainsaw",
+                                    "display_name": "Chainsaw: Analyse SRUM database",
+                                    "description": "Parse SRUDB.dat (requires SOFTWARE hive in the same input set)",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{chainsaw_srum_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Chainsaw SRUM",
+                                        )
+                                    ],
+                                },
+                                {
+                                    "task_name": "openrelik-worker-plaso.tasks.log2timeline",
+                                    "queue_name": "openrelik-worker-plaso",
+                                    "display_name": "Plaso: Log2Timeline",
+                                    "description": "Super timelining",
+                                    "task_config": [],
+                                    "type": "task",
+                                    "uuid": f"{plaso_uuid}",
+                                    "tasks": [
+                                        _ts_leaf(
+                                            sketch_name,
+                                            sketch_id,
+                                            f"{timeline_name} - Plaso",
+                                        )
+                                    ],
+                                },
+                            ],
+                        }
+                    ],
+                }
+            }
+        )
+    }
+
+    return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
+
+
+# Archive extensions handled by openrelik-worker-extraction's
+# extract_archive_task (7zip + tar). Anything outside this set is
+# treated as a plain log and bypasses extraction entirely — feeding a
+# bare .log into the extraction worker raises
+# RuntimeError("7zip or tar execution error.") because neither tool
+# recognises it as an archive.
+_NETWORK_ARCHIVE_SUFFIXES = (
+    ".zip", ".7z", ".rar",
+    ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
+    ".gz", ".bz2", ".xz",
+)
+
+
+def _is_network_archive(filename):
+    """True if `filename` looks like an archive that the extraction
+    worker can unpack. Plain logs (.log, .txt, .syslog, .json, .csv,
+    .ndjson, no-extension) return False so the network workflow skips
+    extract_archive and feeds the file straight into the normalizer.
+    """
+    name = (filename or "").lower()
+    return any(name.endswith(suf) for suf in _NETWORK_ARCHIVE_SUFFIXES)
+
+
+def add_network_ts_tasks_to_workflow(
+    folder_id,
+    workflow_id,
+    sketch_name,
+    sketch_id,
+    timeline_name,
+    is_archive=False,
+):
+    """
+    NETWORK_ ingestion workflow.
+
+    Two layouts depending on input shape:
+
+        is_archive=True  (.zip / .tar.gz / .7z / ...):
+            extract_archive
+              └── openrelik-worker-network-normalizer.normalize
+                    └── timesketch upload (timeline: "<base> - Network")
+
+        is_archive=False (.log / .txt / .syslog / .json / ...):
+            openrelik-worker-network-normalizer.normalize
+              └── timesketch upload (timeline: "<base> - Network")
+
+    The plain-input branch skips extract_archive because the extraction
+    worker invokes 7zip then tar and raises on non-archive input
+    ("7zip or tar execution error."). Network logs commonly arrive
+    bare (an analyst pulls a single .log off a firewall appliance) and
+    only sometimes as a multi-file archive from a SIEM/syslog server
+    export — both shapes need to flow through the same endpoint.
+
+    Single-branch DAG by design: the normalizer worker hosts every
+    supported log format internally (Logstash configs from SOF-ELK), so
+    fan-out happens inside the worker rather than at the workflow layer.
+    Per-format Logstash configs are added in the network-normalizer
+    repo's NET-7 / NET-8 / NET-9 / NET-11 / NET-12 / NET-13 / NET-14
+    PRs.
+    """
+    normalize_uuid = str(uuid.uuid4()).replace("-", "")
+
+    normalize_task = {
+        "task_name": "openrelik-worker-network-normalizer.tasks.normalize",
+        "queue_name": "openrelik-worker-network-normalizer",
+        "display_name": "Network: Normalize to ECS",
+        "description": (
+            "Run network log files through SOF-ELK Logstash configs; "
+            "emit ECS-shaped Timesketch JSONL"
+        ),
+        "task_config": [],
+        "type": "task",
+        "uuid": f"{normalize_uuid}",
+        "tasks": [
+            _ts_leaf(sketch_name, sketch_id, f"{timeline_name} - Network")
+        ],
+    }
+
+    if is_archive:
+        extraction_uuid = str(uuid.uuid4()).replace("-", "")
+        root_tasks = [
+            {
+                "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                "queue_name": "openrelik-worker-extraction",
+                "display_name": "Extract Archives",
+                "description": "Extract files from archive for the network normalizer",
+                "task_config": [],
+                "type": "task",
+                "uuid": f"{extraction_uuid}",
+                "tasks": [normalize_task],
+            }
+        ]
+    else:
+        root_tasks = [normalize_task]
+
+    workflow_spec = {
+        "spec_json": json.dumps(
+            {
+                "workflow": {
+                    "type": "chain",
+                    "isRoot": True,
+                    "tasks": root_tasks,
+                }
+            }
+        )
+    }
+
+    return workflows_api.update_workflow(folder_id, workflow_id, workflow_spec)
+
+
 def run_workflow(folder_id, workflow_id):
     """
     Trigger the workflow execution.
@@ -1223,6 +1593,185 @@ def api_hayabusa():
     return jsonify(
         {
             "message": "Hayabusa Workflow(s) started successfully",
+        }
+    )
+
+
+@app.route("/api/triage/timesketch", methods=["POST"])
+def api_triage_timesketch():
+    """
+    Catchall triage endpoint. Accepts a single archive (typically a
+    Velociraptor KAPE collection zip), extracts it, fans out in parallel
+    to every known analyser (Hayabusa, Chainsaw x3, Plaso), and uploads
+    each analyser's output to Timesketch as a separately named timeline
+    in the same sketch.
+
+    Each worker's compatible-input filter decides whether to process
+    the extracted files or no-op, so a single endpoint handles triage
+    zips regardless of the specific artefacts inside. No per-worker
+    hunts required in Velociraptor — one server-event artefact POSTs
+    to this endpoint and the rest is automatic.
+
+    Parameters:
+      file     (required, multipart) — the archive to triage
+      case_id  (optional) — resolved in this preference order:
+                              1. form data (curl -F "case_id=...")
+                              2. query string (?case_id=...)
+                              3. CASE_ID env var on the pipeline container
+                            If provided through any path, the triage workflow
+                            is created inside a top-level case folder named
+                            case_id (e.g. "Case-2079"). If that folder doesn't
+                            exist, it's created and granted read access for
+                            CASE_FOLDER_READ_GROUP.
+                            If case_id is omitted everywhere, the legacy
+                            behaviour is preserved: a fresh root folder per
+                            zip.
+                            For per-case container deployments
+                            (<case-id>-or.dev.cypfer.io), the env-var path
+                            is the canonical source -- VR callers don't need
+                            to label clients to drive case-folder routing.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    filename = file.filename
+    timeline_name, _extension = os.path.splitext(filename)
+    fqdn, _label = extract_fqdn_and_label(filename)
+
+    # Accept case_id from form data, query string, or the deployment's own
+    # CASE_ID env var. The env var is the right answer for our per-case
+    # container deployments: each OpenRelik instance lives at
+    # <case-id>-or.dev.cypfer.io and serves exactly one case. install.sh
+    # writes CASE_ID into docker-compose.yml at provisioning time.
+    # POST-supplied case_id still wins so per-call testing overrides
+    # remain possible.
+    case_id = (
+        request.form.get("case_id")
+        or request.args.get("case_id")
+        or os.getenv("CASE_ID", "")
+    ).strip()
+
+    sketch_id = 1
+    timeline_name = fqdn if fqdn else timeline_name
+    sketch_name = ""
+
+    file_path = os.path.join("/tmp", filename)
+    file.save(file_path)
+
+    if case_id:
+        folder_id = find_or_create_case_folder(case_id)
+        if folder_id is None:
+            return jsonify({"error": f"Failed to find or create case folder {case_id!r}"}), 500
+    else:
+        folder_id = create_folder(f"{filename} Triage")
+
+    file_id = upload_file(file_path, folder_id)
+    workflow_id, workflow_folder_id = create_workflow(folder_id, [file_id])
+
+    # Always name the workflow's subfolder and the workflow itself. Skipping
+    # the folder rename in the case-folder flow left it showing as
+    # "Untitled Workflow" in the OpenRelik UI.
+    rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
+    rename_workflow(folder_id, workflow_id, f"{filename} Triage Workflow")
+
+    add_triage_ts_tasks_to_workflow(
+        folder_id, workflow_id, sketch_name, sketch_id, timeline_name
+    )
+    run = run_workflow(folder_id, workflow_id)
+
+    return jsonify(
+        {
+            "message": "Triage to Timesketch Workflow started successfully",
+            "case_id": case_id or None,
+            "case_folder_id": folder_id if case_id else None,
+            "workflow_id": workflow_id,
+            "run_details": run,
+        }
+    )
+
+
+@app.route("/api/network/timesketch", methods=["POST"])
+def api_network_timesketch():
+    """
+    Network-log ingestion endpoint. Sibling of /api/triage/timesketch
+    but feeds the openrelik-worker-network-normalizer worker (Logstash +
+    SOF-ELK) instead of the per-tool host analyser fan-out.
+
+    Use this for vendor network logs:
+      * Firewall (Palo Alto, Fortinet, Cisco ASA, ...)
+      * IDS/Network monitoring (Zeek, Suricata)
+      * Cloud audit (CloudTrail, Entra sign-in, Azure NSG, GWS, Okta)
+      * EDR (CrowdStrike, SentinelOne, Defender)
+      * pcap (passes through openrelik-worker-zeek first, future)
+
+    Outputs land in the same case sketch as the HOST_ pipeline so
+    analysts can pivot across both via shared ECS fields.
+
+    Parameters mirror /api/triage/timesketch:
+      file     (required, multipart) — log file or archive
+      case_id  (optional) — same resolution order as the triage route:
+                              1. form data (curl -F "case_id=...")
+                              2. query string (?case_id=...)
+                              3. CASE_ID env var on the pipeline container
+                            If omitted everywhere, falls back to a fresh
+                            root folder per upload.
+
+    Status: NET-2 ships the route + workflow construction. End-to-end
+    parsing requires at least one format-specific Logstash config in the
+    network-normalizer worker (NET-7 onwards). Until then, calling this
+    endpoint creates a workflow that completes extraction but stalls at
+    network_normalize. This is by design for staged delivery.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    filename = file.filename
+    timeline_name, _extension = os.path.splitext(filename)
+    fqdn, _label = extract_fqdn_and_label(filename)
+
+    case_id = (
+        request.form.get("case_id")
+        or request.args.get("case_id")
+        or os.getenv("CASE_ID", "")
+    ).strip()
+
+    sketch_id = 1
+    timeline_name = fqdn if fqdn else timeline_name
+    sketch_name = ""
+
+    file_path = os.path.join("/tmp", filename)
+    file.save(file_path)
+
+    if case_id:
+        folder_id = find_or_create_case_folder(case_id)
+        if folder_id is None:
+            return jsonify({"error": f"Failed to find or create case folder {case_id!r}"}), 500
+    else:
+        folder_id = create_folder(f"{filename} Network")
+
+    file_id = upload_file(file_path, folder_id)
+    workflow_id, workflow_folder_id = create_workflow(folder_id, [file_id])
+
+    rename_folder(workflow_folder_id, f"{filename} Network Workflow Folder")
+    rename_workflow(folder_id, workflow_id, f"{filename} Network Workflow")
+
+    is_archive = _is_network_archive(filename)
+    add_network_ts_tasks_to_workflow(
+        folder_id, workflow_id, sketch_name, sketch_id, timeline_name,
+        is_archive=is_archive,
+    )
+    run = run_workflow(folder_id, workflow_id)
+
+    return jsonify(
+        {
+            "message": "Network to Timesketch Workflow started successfully",
+            "case_id": case_id or None,
+            "case_folder_id": folder_id if case_id else None,
+            "workflow_id": workflow_id,
+            "extracted": is_archive,
+            "run_details": run,
         }
     )
 

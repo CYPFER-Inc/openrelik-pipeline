@@ -511,7 +511,12 @@ EOF
     # enabled. The openrelik-pipeline container logs in as admin/password via
     # timesketch-api-client; without this, Timesketch aborts with
     # "Local authentication is disabled for this user. Please use OAuth."
-    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin']|" "$TS_CONF"
+    #
+    # `ai-summary-worker@cypfer.local` is the Phase 3 AI service account
+    # (microcloud:llm/README.md §3). v1 uses local-password auth from the
+    # worker; Phase 7 will migrate to OIDC bearer via GOOGLE_OIDC_API_CLIENT_ID
+    # at which point this entry can be dropped.
+    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin', 'ai-summary-worker@cypfer.local']|" "$TS_CONF"
 
     # Restart Timesketch to pick up OIDC config. Also bounce nginx: it caches
     # the upstream container IP at startup, and when timesketch-web comes back
@@ -551,6 +556,24 @@ EOF
     chmod 600 "${TS_ROSTER_FILE}"
     echo "Seeded TS roster: ${TS_ROSTER_FILE}"
 
+    # ─── Phase 3 (TS, part 1): roster injection — append AI account ──────────
+    # microcloud:llm/README.md §3. The ai-summary-worker user is just another
+    # row in the TS roster from ts-apply.sh's perspective; let the apply
+    # script create it with its random password (which we override below
+    # AFTER apply has run). Decide the password here so it's available for
+    # the env file later in install.sh; preserve from any prior run.
+    AI_TS_USER="ai-summary-worker@cypfer.local"
+    AI_ENV_FILE="/etc/vote-case-ai.env"
+    if [ -f "${AI_ENV_FILE}" ] && grep -q '^AI_TS_PASSWORD=' "${AI_ENV_FILE}"; then
+      AI_TS_PASSWORD="$(grep '^AI_TS_PASSWORD=' "${AI_ENV_FILE}" | cut -d= -f2- | tr -d '"')"
+      echo "  AI TS password: preserved from ${AI_ENV_FILE}"
+    else
+      AI_TS_PASSWORD="$(openssl rand -hex 32)"
+      echo "  AI TS password: generated"
+    fi
+    echo "${AI_TS_USER}=reader" >> "${TS_ROSTER_FILE}"
+    echo "Appended AI service account to TS roster"
+
     # Apply the roster — TS picks up DB changes live, no restart needed.
     # Roster applier needs the running timesketch-web container (restart above
     # should have completed by now, but give it a moment).
@@ -558,6 +581,52 @@ EOF
     bash /opt/openrelik-pipeline/scripts/roster/ts-apply.sh "${TS_ROSTER_FILE}" \
       2>&1 | tee -a /opt/openrelik-pipeline/logs/ts-roster-apply.log \
       || echo "WARNING: ts-apply.sh returned non-zero — check log"
+
+    # ─── Phase 3 (TS, part 2): force AI password to match the env file ──────
+    # ts-apply.sh just created the AI user with a random password we can't
+    # recover. Force-set it via tsctl shell to match AI_TS_PASSWORD (which
+    # is what gets written into /etc/vote-case-ai.env later).
+    #
+    # Why this runs AFTER ts-apply.sh rather than pre-creating the user
+    # before it: TS takes a long time to accept tsctl exec after the OIDC
+    # restart (>60s observed on case-2092). ts-apply.sh handles that wait
+    # naturally — by the time it returns, TS is known-ready, so this
+    # follow-up tsctl call doesn't need its own wait loop.
+    #
+    # Idempotent across re-runs (force-sets the DB password every time to
+    # match the env file). Self-heals broken cases left over from earlier
+    # buggy install passes.
+    #
+    # tsctl shell is needed because the User model's relationship() to
+    # Sketch requires the full Flask app context — raw `python3 -c` errors
+    # with KeyError: 'Sketch'.
+    #
+    # cd /opt/timesketch is REQUIRED — `docker compose` needs to find the
+    # compose file. Without it, both this exec and the restart below
+    # silently fail with "no configuration file provided: not found",
+    # leaving the AI user with ts-apply.sh's random password and the env
+    # file's password disagreeing. Observed on case-2093.
+    cd /opt/timesketch
+    AI_TS_USER="${AI_TS_USER}" AI_TS_PASSWORD="${AI_TS_PASSWORD}" \
+      docker compose exec -T -e AI_TS_USER -e AI_TS_PASSWORD \
+        timesketch-web tsctl shell <<'PYSHELL'
+import os
+from timesketch.models import db_session
+from timesketch.models.user import User
+u = db_session.query(User).filter_by(username=os.environ["AI_TS_USER"]).first()
+if u is None:
+    raise SystemExit("AI user not found after ts-apply.sh — abort")
+u.set_password(os.environ["AI_TS_PASSWORD"])
+db_session.commit()
+print("AI user password forcibly set to match /etc/vote-case-ai.env")
+PYSHELL
+
+    # Restart timesketch-web so the in-memory user cache picks up the new
+    # password. Without this, /login keeps rejecting even though DB
+    # check_password returns True. Confirmed needed during case-2088 manual
+    # recovery.
+    docker compose restart timesketch-web
+    cd /opt
 
     echo "Timesketch OIDC configured"
   elif [ "${ENVIRONMENT}" = "prod" ]; then
@@ -575,9 +644,22 @@ if [ "${INSTALL_OR}" = "true" ]; then
   cd /opt
   curl -s -O https://raw.githubusercontent.com/cypfer-inc/openrelik-deploy/main/docker/install.sh
 
-  # Pre-pull OpenRelik images from local mirror before the deploy script runs
+  # Pre-pull OpenRelik images from the local mirror before the deploy script
+  # runs.  Two layers to warm:
+  #
+  #   1. TAGGED images that upstream openrelik-deploy/install.sh requests via
+  #      `docker compose pull`.  Those tags pre-date the generic OIDC module so
+  #      we will swap them for digests later -- but the tag-layer pull still
+  #      has to succeed first or upstream's install bails.
+  #
+  #   2. DIGEST-pinned images that pin_compose_image_digest rewrites compose to
+  #      use after the tagged install.  Without this loop, `docker compose
+  #      up -d` after pinning misses the mirror and falls back to the internet
+  #      on every install (slow + Geneve TLS flakes).  Digest list is sourced
+  #      directly from config.env so this stays in lock-step with what is
+  #      actually deployed.
   if [ -n "${REGISTRY_MIRROR:-}" ]; then
-    echo "Pre-pulling OpenRelik images from local mirror..."
+    echo "Pre-pulling OpenRelik images (tagged) from local mirror..."
     for img in \
       ghcr.io/openrelik/openrelik-server:0.7.0 \
       ghcr.io/openrelik/openrelik-ui:0.7.0 \
@@ -595,6 +677,60 @@ if [ "${INSTALL_OR}" = "true" ]; then
       echo "  Pulling ${MIRRORED}..."
       docker pull "${MIRRORED}" 2>/dev/null && \
         docker tag "${MIRRORED}" "${img}" 2>/dev/null || true
+    done
+
+    echo "Pre-pulling OpenRelik images (digest-pinned) from local mirror..."
+    # Base-image map for every digest var that may be pinned in config.env.
+    # Mirrors the IMAGE_MAP in .github/workflows/scan-images.yml -- keep the
+    # two in sync when adding a new digest pin.
+    declare -A DIGEST_IMAGE_MAP=(
+      ["OPENRELIK_SERVER_DIGEST"]="ghcr.io/openrelik/openrelik-server"
+      ["OPENRELIK_UI_DIGEST"]="ghcr.io/openrelik/openrelik-ui"
+      ["OPENRELIK_MEDIATOR_DIGEST"]="ghcr.io/openrelik/openrelik-mediator"
+      ["OPENRELIK_WORKER_PLASO_DIGEST"]="ghcr.io/openrelik/openrelik-worker-plaso"
+      ["OPENRELIK_WORKER_TIMESKETCH_DIGEST"]="ghcr.io/openrelik/openrelik-worker-timesketch"
+      ["OPENRELIK_WORKER_EXTRACTION_DIGEST"]="ghcr.io/openrelik/openrelik-worker-extraction"
+      ["OPENRELIK_WORKER_STRINGS_DIGEST"]="ghcr.io/openrelik/openrelik-worker-strings"
+      ["OPENRELIK_WORKER_GREP_DIGEST"]="ghcr.io/openrelik/openrelik-worker-grep"
+      ["REDIS_DIGEST"]="redis"
+      ["POSTGRES_DIGEST"]="postgres"
+    )
+    for var in "${!DIGEST_IMAGE_MAP[@]}"; do
+      digest="${!var:-}"
+      base="${DIGEST_IMAGE_MAP[$var]}"
+      [ -z "${digest}" ] && continue
+      ref="${base}@${digest}"
+      MIRRORED=$(mirror_image "${ref}")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null \
+        && docker tag "${MIRRORED}" "${ref}" 2>/dev/null \
+        || echo "    WARN: digest pre-pull failed for ${var} (${ref}) -- first install will fall back to internet"
+    done
+
+    echo "Pre-pulling CYPFER images (tagged) from local mirror..."
+    # cypfer-inc/* images that compose / post-install scripts pull. The two
+    # pre-pull loops above only warm upstream openrelik/* and base images;
+    # without this block the case's own pipeline service, the post-install
+    # config images, and the CYPFER-built workers all bypass the mirror on
+    # first install -- slow, and the same Geneve-TLS-flake hazard the digest
+    # loop was added to avoid.
+    #
+    # Tag resolution mirrors what compose / post-install fallback to, so
+    # `:dev` testing flows (PIPELINE_IMAGE=...:dev, etc.) cache the right tag
+    # instead of always warming `:latest`.
+    for img in \
+      "${PIPELINE_IMAGE:-ghcr.io/cypfer-inc/openrelik-pipeline:latest}" \
+      "${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}" \
+      "${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}" \
+      "${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_DIGEST:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
+      MIRRORED=$(mirror_image "${img}")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null \
+        && docker tag "${MIRRORED}" "${img}" 2>/dev/null \
+        || echo "    WARN: ${MIRRORED} not in mirror -- will fall back to internet on first use"
     done
   fi
 
@@ -635,6 +771,10 @@ if [ "${INSTALL_OR}" = "true" ]; then
     source /etc/vote-case.env
     if [ -n "${CASE_ID}" ]; then
       OR_URL="https://${CASE_ID}-or.dev.cypfer.io"
+      # TS public hostname follows the same per-case pattern (nginx routes
+      # 2078-ts.dev.cypfer.io to the case container's TS). Used by Phase 3
+      # AI worker creds in /etc/vote-case-ai.env later in the script.
+      TS_URL="https://${CASE_ID}-ts.dev.cypfer.io"
       echo "Configuring OpenRelik for case ${CASE_ID}..."
 
       # Update config.env and .env
@@ -703,6 +843,13 @@ if [ "${INSTALL_OR}" = "true" ]; then
         } > "${OR_ROSTER_FILE}"
         chmod 600 "${OR_ROSTER_FILE}"
         echo "Seeded OR roster: ${OR_ROSTER_FILE}"
+
+        # ─── Phase 3: AI service account (microcloud:llm/README.md §3) ─────
+        # Append the AI worker as a reader. or-apply.sh will create the OR
+        # user, the OR API key generation block below issues a long-lived
+        # JWT for it, and the result lands in /etc/vote-case-ai.env.
+        echo "ai-summary-worker@cypfer.local=reader" >> "${OR_ROSTER_FILE}"
+        echo "Appended AI service account to OR roster"
 
         # Append [auth.oidc] with an empty allowlist — or-apply.sh will rewrite
         # the allowlist line from the roster once OR is up.
@@ -888,6 +1035,18 @@ psort.py --version || true
   # value now, mirroring the YOUR_API_KEY pattern.
   sed -i "s#YOUR_TS_PASSWORD#${TIMESKETCH_PASSWORD}#g" /opt/openrelik-pipeline/docker-compose.yml
 
+  # Materialize CASE_ID. Sourced earlier from /etc/vote-case.env when the
+  # install runs in vote-managed per-case mode. On non-vote dev installs
+  # CASE_ID is empty and the placeholder is replaced with an empty string;
+  # the pipeline app then falls back to its legacy "fresh root folder per
+  # zip" behaviour for /api/triage/timesketch.
+  sed -i "s#YOUR_CASE_ID#${CASE_ID:-}#g" /opt/openrelik-pipeline/docker-compose.yml
+  if [ -n "${CASE_ID:-}" ]; then
+    echo "Pipeline CASE_ID baked into docker-compose: ${CASE_ID}"
+  else
+    echo "Pipeline CASE_ID empty (non-per-case install) -- legacy folder behaviour"
+  fi
+
   # Persist key to config.env and key file so configure container and rotation cron can use it
   if grep -q "^OPENRELIK_API_KEY=" /opt/openrelik-pipeline/config.env 2>/dev/null; then
     sed -i "s#^OPENRELIK_API_KEY=.*#OPENRELIK_API_KEY=${OPENRELIK_API_KEY}#" /opt/openrelik-pipeline/config.env
@@ -899,6 +1058,43 @@ psort.py --version || true
   echo "API key saved to config.env and .openrelik_api_key"
 
   export OPENRELIK_API_KEY
+
+  # ─── Phase 3: AI service account — OR API key + /etc/vote-case-ai.env ──────
+  # Generate a separate long-lived OR JWT for ai-summary-worker@cypfer.local
+  # (the AI account, NOT the pipeline's admin account). Mirrors the JWT-shape
+  # validation pattern above. The AI account was created earlier by
+  # or-apply.sh from the AI roster row appended in the OR roster block.
+  AI_OR_USER="ai-summary-worker@cypfer.local"
+  AI_OR_API_KEY="$(COLUMNS=1000 docker compose -f "${OR_COMPOSE}" exec -T openrelik-server python admin.py create-api-key "${AI_OR_USER}" --key-name "ai-worker" 2>/dev/null)"
+  AI_OR_API_KEY=$(echo "$AI_OR_API_KEY" | tr -d '[:cntrl:][:space:]')
+  if [ "${#AI_OR_API_KEY}" -lt 100 ] || ! echo "$AI_OR_API_KEY" | grep -qE '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'; then
+    echo "WARNING: AI OR API key does not look like a JWT (len=${#AI_OR_API_KEY})"
+    echo "         AI worker (Phase 5) won't have OR access until this is fixed."
+    AI_OR_API_KEY=""
+  fi
+
+  # Write per-case AI credentials. AI_TS_PASSWORD comes from the TS roster
+  # block earlier in this script (preserved across re-runs). Phase 5 worker
+  # sources this file from the case container; v1 has no consumer yet.
+  AI_ENV_FILE="/etc/vote-case-ai.env"
+  cat > "${AI_ENV_FILE}" <<AIEOF
+# Per-case AI worker credentials — generated by openrelik-pipeline:install.sh
+# on $(date -u +%FT%TZ) for case ${CASE_ID:-unknown}. Phase 3 of the v1 AI
+# integration plan (microcloud:llm/README.md §3).
+#
+# v1 auth model:
+#   TS: HTTP Basic with AI_TS_USER + AI_TS_PASSWORD against AI_TS_URL
+#   OR: Authorization: Bearer ${AI_OR_API_KEY:0:8}... against AI_OR_URL
+# Phase 7 migrates TS to OIDC bearer; this file's TS_* fields will go away.
+AI_ACCOUNT="${AI_TS_USER}"
+AI_TS_URL="${TS_URL:-}"
+AI_TS_USER="${AI_TS_USER}"
+AI_TS_PASSWORD="${AI_TS_PASSWORD}"
+AI_OR_URL="${OR_URL:-}"
+AI_OR_API_KEY="${AI_OR_API_KEY}"
+AIEOF
+  chmod 600 "${AI_ENV_FILE}"
+  echo "Wrote AI worker credentials: ${AI_ENV_FILE} (chmod 600)"
 
   # Authenticate to GHCR for private image pulls
   if [ -n "${GHCR_USER}" ] && [ -n "${GHCR_TOKEN}" ]; then
@@ -1003,6 +1199,43 @@ psort.py --version || true
     exit 1
   fi
 
+  # ─── Inject openrelik-worker-network-normalizer ───────────────────────────
+  # Same shape as the timesketch-worker block above. Powers the NETWORK_
+  # ingestion pipeline (/api/network/timesketch in app.py + the
+  # CYPFER.Network.Normalize.Timesketch workflow template). Without this
+  # block, every network-normalize task silently queues forever — same
+  # failure mode case-2073 surfaced for the timesketch worker.
+  #
+  # Re-grep for ^volumes: because the timesketch injection above pushed it
+  # down by ~13 lines.
+  echo "Injecting openrelik-worker-network-normalizer into ${OR_COMPOSE}..."
+  line=$(grep -n "^volumes:" "${OR_COMPOSE}" | head -n1 | cut -d: -f1)
+  if [ -z "${line}" ]; then
+    echo "ERROR: no 'volumes:' anchor in ${OR_COMPOSE} — cannot inject openrelik-worker-network-normalizer"
+    exit 1
+  fi
+  insert_line=$((line - 1))
+
+  NETWORK_NORMALIZER_VERSION="${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}"
+
+  sed -i "${insert_line}i\\
+  \\
+  openrelik-worker-network-normalizer:\\
+      container_name: openrelik-worker-network-normalizer\\
+      image: ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${NETWORK_NORMALIZER_VERSION}\\
+      restart: always\\
+      environment:\\
+        - REDIS_URL=redis://openrelik-redis:6379\\
+      volumes:\\
+        - ./data:/usr/share/openrelik/data\\
+      command: \"celery --app=src.app worker --task-events --concurrency=2 --loglevel=INFO -Q openrelik-worker-network-normalizer\"
+" "${OR_COMPOSE}"
+
+  if ! grep -q "openrelik-worker-network-normalizer:" "${OR_COMPOSE}"; then
+    echo "ERROR: openrelik-worker-network-normalizer block was not injected into ${OR_COMPOSE}"
+    exit 1
+  fi
+
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
     docker network connect openrelik_default timesketch-web 2>/dev/null \
@@ -1041,6 +1274,61 @@ psort.py --version || true
   else
     echo "WARNING: openrelik-worker-timesketch failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-timesketch"
+  fi
+
+  # Start the network-normalizer worker (NETWORK_ pipeline)
+  docker compose up -d openrelik-worker-network-normalizer 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-network-normalizer"; then
+    echo "openrelik-worker-network-normalizer is running"
+  else
+    echo "WARNING: openrelik-worker-network-normalizer failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-network-normalizer"
+  fi
+
+  # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
+  # configure.py adds the worker's compose block to docker-compose.yml from
+  # the openrelik-or-config image AND eagerly starts the container with no
+  # AI_* env vars set — `docker compose up -d` here would be a no-op (the
+  # container already exists; compose only recreates if the file changed,
+  # which it didn't from compose's perspective even though the SHELL env
+  # changed). Use --force-recreate so the AI_* vars sourced below actually
+  # land in the running container.
+  #
+  # The worker env splits across two files by ownership domain:
+  #   /etc/vote-case-ai.env   — TS + OR creds, written by THIS install.sh
+  #                             Phase 3 block from case-local tsctl /
+  #                             admin.py outputs.
+  #   /etc/vote-case-llm.env  — LiteLLM URL + per-case virtual key, written
+  #                             by microcloud:scripts/vote.sh during
+  #                             `vote launch` (master-key call against the
+  #                             services-1 LiteLLM proxy lives on the MC
+  #                             initiator, never inside the case container).
+  # Source both before the recreate so the compose snippet from
+  # openrelik-or-config:workers/openrelik-worker-llm-summary.yml interpolates
+  # the full AI_* set. Absent files warned but non-fatal — the worker's
+  # _required_env still fails fast on first task with a clear error if
+  # anything's missing.
+  if grep -q "openrelik-worker-llm-summary" /opt/openrelik/docker-compose.yml 2>/dev/null; then
+    for env_file in /etc/vote-case-ai.env /etc/vote-case-llm.env; do
+      if [ -r "${env_file}" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        . "${env_file}"
+        set +a
+        echo "Sourced AI worker creds from ${env_file} for compose interpolation"
+      else
+        echo "WARNING: ${env_file} not found — some AI_* env vars will be empty"
+      fi
+    done
+    docker compose up -d --force-recreate openrelik-worker-llm-summary 2>/dev/null
+
+    if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-llm-summary"; then
+      echo "openrelik-worker-llm-summary is running"
+    else
+      echo "WARNING: openrelik-worker-llm-summary failed to start"
+      echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-llm-summary"
+    fi
   fi
 
   echo "OpenRelik deployment complete"
@@ -1134,7 +1422,7 @@ if [ "${INSTALL_VR}" = "true" ]; then
     ports:
       - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
-      - "8889:8889" """ | sudo tee -a ./docker-compose.yml > /dev/null
+      - "8889:8889" """ | sudo tee ./docker-compose.yml > /dev/null
 
   VR_BASE_IMAGE=$(mirror_image "ubuntu:22.04")
   # openssl + python3 + python3-yaml are needed for the per-case Frontend cert
@@ -1636,6 +1924,110 @@ elif [ -z "${LOKI_URL:-}" ]; then
   PROMTAIL_STATUS="skipped (no LOKI_URL)"
 fi
 
+# ─── Phase 4B: authentik-sync reconciler + bootstrap seed ────────────────────
+# When /etc/authentik-sync.env is present (vote.sh writes it under PHASE4B=1),
+# (1) seed the case-<CASE_ID>-<role> Authentik groups with the bootstrap users
+#     so the reconciler's first tick sees them and doesn't mass-revoke;
+# (2) deploy the reconciler + systemd units + enable the 60s timer.
+#
+# No-op when /etc/authentik-sync.env is absent — pre-4B cases and 4A-only
+# cases continue through without the reconciler.
+AUTHENTIK_SYNC_STATUS="skipped (not PHASE4B)"
+if [ -r /etc/authentik-sync.env ]; then
+  echo ""
+  echo "Phase 4B: seeding Authentik bootstrap + deploying authentik-sync..."
+  AUTHENTIK_SYNC_FAILED="false"
+  (
+    # Subshell so sourced env doesn't leak into later sections.
+    set -e
+    . /etc/authentik-sync.env  # AUTHENTIK_BASE_URL, AUTHENTIK_API_TOKEN
+    . /etc/vote-case.env       # CASE_ID
+
+    AK_API="${AUTHENTIK_BASE_URL%/}/api/v3"
+
+    # Union TS/OR/VR bootstrap lists with admin > investigator > reader
+    # precedence, so each user shows up in exactly one role group.
+    declare -A B
+    for csv in "${TS_BOOTSTRAP_USERS:-}" "${OR_BOOTSTRAP_USERS:-}" "${VR_BOOTSTRAP_USERS:-}"; do
+      IFS=',' read -ra PAIRS <<< "$csv"
+      for entry in "${PAIRS[@]}"; do
+        entry=$(echo "$entry" | xargs)
+        [ -z "$entry" ] && continue
+        email="${entry%%:*}"
+        role="${entry#*:}"
+        [ "$role" = "$entry" ] && role="reader"
+        case "$role" in admin|investigator|reader) ;; *) role="reader" ;; esac
+        current="${B[$email]:-}"
+        # Precedence: if current is admin, keep. If current is investigator
+        # and new isn't admin, keep. Otherwise overwrite.
+        if [ "$current" = "admin" ]; then continue; fi
+        if [ "$current" = "investigator" ] && [ "$role" != "admin" ]; then continue; fi
+        B[$email]=$role
+      done
+    done
+
+    # Cache group pks.
+    declare -A GROUP_PK
+    for r in admin investigator reader; do
+      gname="case-${CASE_ID}-${r}"
+      pk=$(curl -sS -H "Authorization: Bearer $AUTHENTIK_API_TOKEN" \
+            "$AK_API/core/groups/?name=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$gname")" \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("results",[{}])[0]; print(r.get("pk",""))')
+      if [ -z "$pk" ]; then
+        echo "  ERROR: Authentik group $gname not found — case not fully provisioned"
+        exit 1
+      fi
+      GROUP_PK[$r]=$pk
+    done
+
+    # Add each bootstrap user to their group.
+    for email in "${!B[@]}"; do
+      role="${B[$email]}"
+      user_pk=$(curl -sS -H "Authorization: Bearer $AUTHENTIK_API_TOKEN" \
+                 "$AK_API/core/users/?email=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$email")" \
+                 | python3 -c 'import json,sys; d=json.load(sys.stdin); r=d.get("results",[{}])[0]; print(r.get("pk",""))')
+      if [ -z "$user_pk" ]; then
+        echo "  SKIP: $email not in Authentik (create via UI first)"
+        continue
+      fi
+      code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+             -H "Authorization: Bearer $AUTHENTIK_API_TOKEN" \
+             -H "Content-Type: application/json" \
+             -d "{\"pk\":$user_pk}" \
+             "$AK_API/core/groups/${GROUP_PK[$role]}/add_user/")
+      if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
+        echo "  OK: $email → case-${CASE_ID}-${role}"
+      else
+        echo "  WARN: add_user $email → case-${CASE_ID}-${role} returned HTTP $code"
+      fi
+    done
+
+    # Deploy reconciler + units.
+    install -d -m 0755 /opt/authentik-sync
+    install -m 0755 "${SCRIPT_DIR}/authentik-sync/authentik-sync.sh"      /opt/authentik-sync/authentik-sync.sh
+    install -m 0644 "${SCRIPT_DIR}/authentik-sync/authentik-sync.service" /etc/systemd/system/authentik-sync.service
+    install -m 0644 "${SCRIPT_DIR}/authentik-sync/authentik-sync.timer"   /etc/systemd/system/authentik-sync.timer
+
+    # Log file needs to exist before promtail tails it; 0640 root:adm keeps
+    # it readable for promtail without broadening the reconciler's writes.
+    touch /var/log/authentik-sync.log
+    chmod 0640 /var/log/authentik-sync.log
+    chown root:adm /var/log/authentik-sync.log 2>/dev/null || true
+
+    systemctl daemon-reload
+    systemctl enable --now authentik-sync.timer
+    echo "  authentik-sync.timer enabled (60s cadence)"
+  ) || AUTHENTIK_SYNC_FAILED="true"
+
+  if [ "$AUTHENTIK_SYNC_FAILED" = "true" ]; then
+    echo "Phase 4B: deploy FAILED — authentik-sync not running, reconciliation disabled"
+    AUTHENTIK_SYNC_STATUS="FAILED"
+    emit_install_audit install-error error authentik-sync
+  else
+    AUTHENTIK_SYNC_STATUS="OK"
+  fi
+fi
+
 echo "═══════════════════════════════════════════════════"
 echo "Install complete"
 
@@ -1679,8 +2071,9 @@ else
   echo "  Velociraptor: skipped"
 fi
 
-echo "  Promtail:     ${PROMTAIL_STATUS}"
-echo "  TS Audit:     ${TS_AUDIT_STATUS}"
+echo "  Promtail:        ${PROMTAIL_STATUS}"
+echo "  TS Audit:        ${TS_AUDIT_STATUS}"
+echo "  authentik-sync:  ${AUTHENTIK_SYNC_STATUS}"
 
 emit_install_audit install-complete "${INSTALL_OVERALL_VERDICT}"
 
