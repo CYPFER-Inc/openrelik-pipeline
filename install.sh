@@ -706,6 +706,32 @@ if [ "${INSTALL_OR}" = "true" ]; then
         && docker tag "${MIRRORED}" "${ref}" 2>/dev/null \
         || echo "    WARN: digest pre-pull failed for ${var} (${ref}) -- first install will fall back to internet"
     done
+
+    echo "Pre-pulling CYPFER images (tagged) from local mirror..."
+    # cypfer-inc/* images that compose / post-install scripts pull. The two
+    # pre-pull loops above only warm upstream openrelik/* and base images;
+    # without this block the case's own pipeline service, the post-install
+    # config images, and the CYPFER-built workers all bypass the mirror on
+    # first install -- slow, and the same Geneve-TLS-flake hazard the digest
+    # loop was added to avoid.
+    #
+    # Tag resolution mirrors what compose / post-install fallback to, so
+    # `:dev` testing flows (PIPELINE_IMAGE=...:dev, etc.) cache the right tag
+    # instead of always warming `:latest`.
+    for img in \
+      "${PIPELINE_IMAGE:-ghcr.io/cypfer-inc/openrelik-pipeline:latest}" \
+      "${OR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-or-config:latest}" \
+      "${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}" \
+      "${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_DIGEST:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
+      MIRRORED=$(mirror_image "${img}")
+      echo "  Pulling ${MIRRORED}..."
+      docker pull "${MIRRORED}" 2>/dev/null \
+        && docker tag "${MIRRORED}" "${img}" 2>/dev/null \
+        || echo "    WARN: ${MIRRORED} not in mirror -- will fall back to internet on first use"
+    done
   fi
 
   echo "1" | bash install.sh 2>&1 | tee /opt/openrelik-pipeline/logs/openrelik-install.log
