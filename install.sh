@@ -557,14 +557,30 @@ EOF
     echo "Seeded TS roster: ${TS_ROSTER_FILE}"
 
     # ─── Phase 3: AI service account (microcloud:llm/README.md §3) ───────────
-    # Append the AI worker to the roster as a reader. Pre-create it with a
-    # known password BEFORE ts-apply.sh runs so the apply's "if not exists"
-    # branch doesn't fire (which would assign a random password we couldn't
-    # recover — tsctl has no reset-password primitive, and deleting+
-    # recreating would also wipe the sketch ACL grants).
+    # Pre-create the AI worker in TS with a known password BEFORE ts-apply.sh
+    # runs (the apply's "if not exists" branch otherwise assigns a random
+    # password — tsctl has no reset-password primitive). Password preserved
+    # across re-runs by reading the existing /etc/vote-case-ai.env.
     #
-    # The password is preserved across re-runs by reading the existing
-    # /etc/vote-case-ai.env if present.
+    # Two race conditions this block defends against — both observed on
+    # case-2088 before this hardening landed:
+    #
+    #   1. TS just-restarted (above) isn't yet accepting tsctl exec; the
+    #      original `2>/dev/null || echo ...` swallowed the error and the
+    #      install proceeded with no AI user created. Then ts-apply.sh
+    #      created one with a RANDOM password while /etc/vote-case-ai.env
+    #      held a DIFFERENT one. Fixed: poll tsctl until it's ready (60s
+    #      budget) before any password-setting step.
+    #
+    #   2. `tsctl create-user --password` returns "user already exists" if
+    #      the user pre-exists from any prior run, but does NOT re-set the
+    #      password — leaving env file and DB silently disagreeing. Fixed:
+    #      ALWAYS call set_password() via tsctl shell after create-user,
+    #      idempotently. Self-heals broken cases on install re-run.
+    #
+    # The post-set restart of timesketch-web is also load-bearing — TS
+    # caches the user record in memory and /login keeps rejecting after a
+    # DB-only password change until the process restarts.
     AI_TS_USER="ai-summary-worker@cypfer.local"
     AI_ENV_FILE="/etc/vote-case-ai.env"
     if [ -f "${AI_ENV_FILE}" ] && grep -q '^AI_TS_PASSWORD=' "${AI_ENV_FILE}"; then
@@ -574,11 +590,63 @@ EOF
       AI_TS_PASSWORD="$(openssl rand -hex 32)"
       echo "  AI TS password: generated"
     fi
-    docker compose exec -T timesketch-web tsctl create-user \
-        "${AI_TS_USER}" --password "${AI_TS_PASSWORD}" 2>/dev/null \
-      || echo "  AI TS user already exists — keeping its existing password"
+
+    # Wait for TS to accept tsctl exec (defends against race #1 above).
+    echo "  Waiting for TS to accept tsctl exec..."
+    AI_TS_READY=0
+    for i in $(seq 1 30); do
+      if docker compose exec -T timesketch-web tsctl list-users >/dev/null 2>&1; then
+        AI_TS_READY=1
+        break
+      fi
+      sleep 2
+    done
+    if [ "${AI_TS_READY}" != "1" ]; then
+      echo "ERROR: timesketch-web didn't accept tsctl exec within 60s — refusing to proceed with AI account block to avoid silent password drift" >&2
+      exit 1
+    fi
+
+    # Create (idempotent: already-exists is fine, captured stderr distinguishes
+    # from real failures). Any unexpected non-zero exit fails loudly.
+    AI_CREATE_ERR=$(docker compose exec -T timesketch-web tsctl create-user \
+        "${AI_TS_USER}" --password "${AI_TS_PASSWORD}" 2>&1)
+    AI_CREATE_RC=$?
+    if [ "${AI_CREATE_RC}" != "0" ]; then
+      if echo "${AI_CREATE_ERR}" | grep -qiE 'already exists|user.*exist'; then
+        echo "  AI TS user already exists (will force-set password below)"
+      else
+        echo "ERROR: tsctl create-user failed (rc=${AI_CREATE_RC}): ${AI_CREATE_ERR}" >&2
+        exit 1
+      fi
+    fi
+
+    # Force-set the DB password to match AI_TS_PASSWORD via tsctl shell.
+    # Idempotent — runs whether create succeeded or the user pre-existed.
+    # Defends against race #2 above. tsctl shell loads the full Flask app
+    # context (including the User model's relationship to Sketch), which a
+    # raw `python3 -c` invocation can't.
+    AI_TS_USER="${AI_TS_USER}" AI_TS_PASSWORD="${AI_TS_PASSWORD}" \
+      docker compose exec -T -e AI_TS_USER -e AI_TS_PASSWORD \
+        timesketch-web tsctl shell <<'PYSHELL'
+import os
+from timesketch.models import db_session
+from timesketch.models.user import User
+u = db_session.query(User).filter_by(username=os.environ["AI_TS_USER"]).first()
+if u is None:
+    raise SystemExit("AI user not found after create-user — abort")
+u.set_password(os.environ["AI_TS_PASSWORD"])
+db_session.commit()
+print("AI user password forcibly set to match /etc/vote-case-ai.env")
+PYSHELL
+
     echo "${AI_TS_USER}=reader" >> "${TS_ROSTER_FILE}"
     echo "Appended AI service account to TS roster"
+
+    # Restart timesketch-web so the in-memory user cache picks up the new
+    # password. Without this, /login keeps rejecting even though DB
+    # check_password returns True.
+    docker compose restart timesketch-web
+    sleep 5
 
     # Apply the roster — TS picks up DB changes live, no restart needed.
     # Roster applier needs the running timesketch-web container (restart above
