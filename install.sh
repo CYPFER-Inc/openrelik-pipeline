@@ -606,20 +606,40 @@ EOF
     # silently fail with "no configuration file provided: not found",
     # leaving the AI user with ts-apply.sh's random password and the env
     # file's password disagreeing. Observed on case-2093.
+    #
+    # tsctl shell drops into code.InteractiveConsole — a REPL that keeps
+    # any `if X:` (even single-line `if X: Y`) open until it sees a blank
+    # line, in case an `elif`/`else` follows. The next un-indented
+    # statement is then parsed as part of the if-block and raises
+    # SyntaxError. The REPL silently recovers, the rest of the heredoc
+    # runs, and any unconditional success print masks the failure.
+    # Observed on case-2094 with `if u is None: raise ...` — set_password
+    # never executed, audit user lookups silently kept the random
+    # password ts-apply.sh assigned. Fix: use `assert` (single
+    # statement, no continuation). Print the actual check_password()
+    # result so bash can verify post-state and abort if the change
+    # didn't persist.
     cd /opt/timesketch
     AI_TS_USER="${AI_TS_USER}" AI_TS_PASSWORD="${AI_TS_PASSWORD}" \
       docker compose exec -T -e AI_TS_USER -e AI_TS_PASSWORD \
-        timesketch-web tsctl shell <<'PYSHELL'
+        timesketch-web tsctl shell <<'PYSHELL' 2>&1 | tee /tmp/ai-pwset.out
 import os
 from timesketch.models import db_session
 from timesketch.models.user import User
 u = db_session.query(User).filter_by(username=os.environ["AI_TS_USER"]).first()
-if u is None:
-    raise SystemExit("AI user not found after ts-apply.sh — abort")
+assert u is not None, "AI user not found after ts-apply.sh"
 u.set_password(os.environ["AI_TS_PASSWORD"])
 db_session.commit()
-print("AI user password forcibly set to match /etc/vote-case-ai.env")
+print("AI_PWSET_VERIFIED=" + str(u.check_password(os.environ["AI_TS_PASSWORD"])))
 PYSHELL
+    if grep -q "AI_PWSET_VERIFIED=True" /tmp/ai-pwset.out; then
+      echo "AI user password forcibly set to match /etc/vote-case-ai.env"
+    else
+      echo "FATAL: AI user password set_password did not persist — tsctl output above" >&2
+      rm -f /tmp/ai-pwset.out
+      exit 1
+    fi
+    rm -f /tmp/ai-pwset.out
 
     # Restart timesketch-web so the in-memory user cache picks up the new
     # password. Without this, /login keeps rejecting even though DB
