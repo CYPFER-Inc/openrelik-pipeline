@@ -1256,6 +1256,42 @@ AIEOF
     exit 1
   fi
 
+  # ─── Inject openrelik-worker-chainsaw ─────────────────────────────────────
+  # CYPFER-built worker for Sigma EVTX hunting (hunt_evtx, builtin_only) +
+  # SRUM analysis (analyse_srum). Single Celery queue serves all three
+  # tasks. Powered by the /api/triage/timesketch fan-out (3 of the 5
+  # branches are chainsaw tasks). Without this block, those branches stall
+  # at task-dispatch -- same failure mode case-2073 / case-2094 surfaced.
+  #
+  # Re-grep for ^volumes: because the prior injections pushed it down.
+  echo "Injecting openrelik-worker-chainsaw into ${OR_COMPOSE}..."
+  line=$(grep -n "^volumes:" "${OR_COMPOSE}" | head -n1 | cut -d: -f1)
+  if [ -z "${line}" ]; then
+    echo "ERROR: no 'volumes:' anchor in ${OR_COMPOSE} — cannot inject openrelik-worker-chainsaw"
+    exit 1
+  fi
+  insert_line=$((line - 1))
+
+  CHAINSAW_VERSION="${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}"
+
+  sed -i "${insert_line}i\\
+  \\
+  openrelik-worker-chainsaw:\\
+      container_name: openrelik-worker-chainsaw\\
+      image: ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${CHAINSAW_VERSION}\\
+      restart: always\\
+      environment:\\
+        - REDIS_URL=redis://openrelik-redis:6379\\
+      volumes:\\
+        - ./data:/usr/share/openrelik/data\\
+      command: \"celery --app=src.app worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-chainsaw\"
+" "${OR_COMPOSE}"
+
+  if ! grep -q "openrelik-worker-chainsaw:" "${OR_COMPOSE}"; then
+    echo "ERROR: openrelik-worker-chainsaw block was not injected into ${OR_COMPOSE}"
+    exit 1
+  fi
+
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
     docker network connect openrelik_default timesketch-web 2>/dev/null \
@@ -1304,6 +1340,16 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-network-normalizer failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-network-normalizer"
+  fi
+
+  # Start the chainsaw worker (Sigma EVTX hunting + SRUM, used by triage fan-out)
+  docker compose up -d openrelik-worker-chainsaw 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-chainsaw"; then
+    echo "openrelik-worker-chainsaw is running"
+  else
+    echo "WARNING: openrelik-worker-chainsaw failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-chainsaw"
   fi
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
