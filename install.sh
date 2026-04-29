@@ -1256,41 +1256,15 @@ AIEOF
     exit 1
   fi
 
-  # ─── Inject openrelik-worker-chainsaw ─────────────────────────────────────
-  # CYPFER-built worker for Sigma EVTX hunting (hunt_evtx, builtin_only) +
-  # SRUM analysis (analyse_srum). Single Celery queue serves all three
-  # tasks. Powered by the /api/triage/timesketch fan-out (3 of the 5
-  # branches are chainsaw tasks). Without this block, those branches stall
-  # at task-dispatch -- same failure mode case-2073 / case-2094 surfaced.
-  #
-  # Re-grep for ^volumes: because the prior injections pushed it down.
-  echo "Injecting openrelik-worker-chainsaw into ${OR_COMPOSE}..."
-  line=$(grep -n "^volumes:" "${OR_COMPOSE}" | head -n1 | cut -d: -f1)
-  if [ -z "${line}" ]; then
-    echo "ERROR: no 'volumes:' anchor in ${OR_COMPOSE} — cannot inject openrelik-worker-chainsaw"
-    exit 1
-  fi
-  insert_line=$((line - 1))
-
-  CHAINSAW_VERSION="${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}"
-
-  sed -i "${insert_line}i\\
-  \\
-  openrelik-worker-chainsaw:\\
-      container_name: openrelik-worker-chainsaw\\
-      image: ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${CHAINSAW_VERSION}\\
-      restart: always\\
-      environment:\\
-        - REDIS_URL=redis://openrelik-redis:6379\\
-      volumes:\\
-        - ./data:/usr/share/openrelik/data\\
-      command: \"celery --app=src.app worker --task-events --concurrency=1 --loglevel=INFO -Q openrelik-worker-chainsaw\"
-" "${OR_COMPOSE}"
-
-  if ! grep -q "openrelik-worker-chainsaw:" "${OR_COMPOSE}"; then
-    echo "ERROR: openrelik-worker-chainsaw block was not injected into ${OR_COMPOSE}"
-    exit 1
-  fi
+  # NOTE: openrelik-worker-chainsaw is NOT injected here. The
+  # openrelik-or-config configure.py step (above) already writes the
+  # chainsaw service block to /opt/openrelik/docker-compose.yml from
+  # workers/openrelik-worker-chainsaw.yml in the or-config repo. Adding
+  # a sed injection here produced a duplicate-key YAML error and broke
+  # all subsequent compose operations on case-2096 (verified the
+  # chainsaw block appeared twice). The bring-up step below still runs
+  # via `docker compose up -d`, mirroring the pattern used for the
+  # llm-summary worker.
 
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
