@@ -1806,6 +1806,29 @@ if [ "${INSTALL_TS}" = "true" ]; then
     TS_CONFIG_EXIT=$?
     if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
       echo "Timesketch configuration complete"
+
+      # Re-run ts-apply.sh now that the default sketch exists. The
+      # install-time run earlier in this script skipped per-sketch ACL
+      # grants with "no sketches yet — skipping" because ts-config
+      # hadn't yet created the default sketch. Without this re-run, no
+      # roster user — including ai-summary-worker@cypfer.local — has an
+      # ACL on the default sketch, and the AI worker fails with HTTP
+      # 403 on /sketches/{id}/archive/ when fetching events. Hit on
+      # case-2099 during Phase 6 acceptance; manual fix was
+      # `tsctl grant-user ai-summary-worker@cypfer.local --sketch_id 1`.
+      #
+      # Idempotent: tsctl grant-user does not insert duplicate
+      # sketch_accesscontrolentry rows on re-run, so this is safe even
+      # when the analyst-team has been growing via `vote grant` between
+      # installs.
+      if [ -n "${TS_ROSTER_FILE:-}" ] && [ -f "${TS_ROSTER_FILE}" ]; then
+        echo "  Re-running ts-apply.sh to grant default-sketch ACLs..."
+        bash /opt/openrelik-pipeline/scripts/roster/ts-apply.sh "${TS_ROSTER_FILE}" \
+          2>&1 | tee -a /opt/openrelik-pipeline/logs/ts-roster-apply.log \
+          || echo "WARNING: post-sketch ts-apply.sh returned non-zero — check log"
+      else
+        echo "  Skipping post-sketch ts-apply.sh (no roster file — non-vote install path)"
+      fi
     else
       echo "ERROR: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
       echo "       /opt/openrelik-pipeline/logs/ts-config.log"
