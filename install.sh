@@ -606,20 +606,40 @@ EOF
     # silently fail with "no configuration file provided: not found",
     # leaving the AI user with ts-apply.sh's random password and the env
     # file's password disagreeing. Observed on case-2093.
+    #
+    # tsctl shell drops into code.InteractiveConsole — a REPL that keeps
+    # any `if X:` (even single-line `if X: Y`) open until it sees a blank
+    # line, in case an `elif`/`else` follows. The next un-indented
+    # statement is then parsed as part of the if-block and raises
+    # SyntaxError. The REPL silently recovers, the rest of the heredoc
+    # runs, and any unconditional success print masks the failure.
+    # Observed on case-2094 with `if u is None: raise ...` — set_password
+    # never executed, audit user lookups silently kept the random
+    # password ts-apply.sh assigned. Fix: use `assert` (single
+    # statement, no continuation). Print the actual check_password()
+    # result so bash can verify post-state and abort if the change
+    # didn't persist.
     cd /opt/timesketch
     AI_TS_USER="${AI_TS_USER}" AI_TS_PASSWORD="${AI_TS_PASSWORD}" \
       docker compose exec -T -e AI_TS_USER -e AI_TS_PASSWORD \
-        timesketch-web tsctl shell <<'PYSHELL'
+        timesketch-web tsctl shell <<'PYSHELL' 2>&1 | tee /tmp/ai-pwset.out
 import os
 from timesketch.models import db_session
 from timesketch.models.user import User
 u = db_session.query(User).filter_by(username=os.environ["AI_TS_USER"]).first()
-if u is None:
-    raise SystemExit("AI user not found after ts-apply.sh — abort")
+assert u is not None, "AI user not found after ts-apply.sh"
 u.set_password(os.environ["AI_TS_PASSWORD"])
 db_session.commit()
-print("AI user password forcibly set to match /etc/vote-case-ai.env")
+print("AI_PWSET_VERIFIED=" + str(u.check_password(os.environ["AI_TS_PASSWORD"])))
 PYSHELL
+    if grep -q "AI_PWSET_VERIFIED=True" /tmp/ai-pwset.out; then
+      echo "AI user password forcibly set to match /etc/vote-case-ai.env"
+    else
+      echo "FATAL: AI user password set_password did not persist — tsctl output above" >&2
+      rm -f /tmp/ai-pwset.out
+      exit 1
+    fi
+    rm -f /tmp/ai-pwset.out
 
     # Restart timesketch-web so the in-memory user cache picks up the new
     # password. Without this, /login keeps rejecting even though DB
@@ -724,7 +744,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
       "${TS_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-ts-config:latest}" \
       "${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}" \
-      "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_DIGEST:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
       MIRRORED=$(mirror_image "${img}")
       echo "  Pulling ${MIRRORED}..."
@@ -1236,6 +1256,16 @@ AIEOF
     exit 1
   fi
 
+  # NOTE: openrelik-worker-chainsaw is NOT injected here. The
+  # openrelik-or-config configure.py step (above) already writes the
+  # chainsaw service block to /opt/openrelik/docker-compose.yml from
+  # workers/openrelik-worker-chainsaw.yml in the or-config repo. Adding
+  # a sed injection here produced a duplicate-key YAML error and broke
+  # all subsequent compose operations on case-2096 (verified the
+  # chainsaw block appeared twice). The bring-up step below still runs
+  # via `docker compose up -d`, mirroring the pattern used for the
+  # llm-summary worker.
+
   # Connect timesketch-web to the openrelik network
   if docker ps --format "{{.Names}}" | grep -q "^timesketch-web$"; then
     docker network connect openrelik_default timesketch-web 2>/dev/null \
@@ -1286,6 +1316,16 @@ AIEOF
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-network-normalizer"
   fi
 
+  # Start the chainsaw worker (Sigma EVTX hunting + SRUM, used by triage fan-out)
+  docker compose up -d openrelik-worker-chainsaw 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-chainsaw"; then
+    echo "openrelik-worker-chainsaw is running"
+  else
+    echo "WARNING: openrelik-worker-chainsaw failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-chainsaw"
+  fi
+
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
   # configure.py adds the worker's compose block to docker-compose.yml from
   # the openrelik-or-config image AND eagerly starts the container with no
@@ -1310,7 +1350,11 @@ AIEOF
   # _required_env still fails fast on first task with a clear error if
   # anything's missing.
   if grep -q "openrelik-worker-llm-summary" /opt/openrelik/docker-compose.yml 2>/dev/null; then
-    for env_file in /etc/vote-case-ai.env /etc/vote-case-llm.env; do
+    # /etc/vote-case.env contributes CASE_ID — without it the worker
+    # comes up with empty CASE_ID and every audit event gets misattributed
+    # (caught on case-2094). Order matters: case.env first so CASE_ID is
+    # available when ai.env / llm.env are sourced (in case any references it).
+    for env_file in /etc/vote-case.env /etc/vote-case-ai.env /etc/vote-case-llm.env; do
       if [ -r "${env_file}" ]; then
         set -a
         # shellcheck disable=SC1090
@@ -1762,6 +1806,29 @@ if [ "${INSTALL_TS}" = "true" ]; then
     TS_CONFIG_EXIT=$?
     if [ "${TS_CONFIG_EXIT}" -eq 0 ]; then
       echo "Timesketch configuration complete"
+
+      # Re-run ts-apply.sh now that the default sketch exists. The
+      # install-time run earlier in this script skipped per-sketch ACL
+      # grants with "no sketches yet — skipping" because ts-config
+      # hadn't yet created the default sketch. Without this re-run, no
+      # roster user — including ai-summary-worker@cypfer.local — has an
+      # ACL on the default sketch, and the AI worker fails with HTTP
+      # 403 on /sketches/{id}/archive/ when fetching events. Hit on
+      # case-2099 during Phase 6 acceptance; manual fix was
+      # `tsctl grant-user ai-summary-worker@cypfer.local --sketch_id 1`.
+      #
+      # Idempotent: tsctl grant-user does not insert duplicate
+      # sketch_accesscontrolentry rows on re-run, so this is safe even
+      # when the analyst-team has been growing via `vote grant` between
+      # installs.
+      if [ -n "${TS_ROSTER_FILE:-}" ] && [ -f "${TS_ROSTER_FILE}" ]; then
+        echo "  Re-running ts-apply.sh to grant default-sketch ACLs..."
+        bash /opt/openrelik-pipeline/scripts/roster/ts-apply.sh "${TS_ROSTER_FILE}" \
+          2>&1 | tee -a /opt/openrelik-pipeline/logs/ts-roster-apply.log \
+          || echo "WARNING: post-sketch ts-apply.sh returned non-zero — check log"
+      else
+        echo "  Skipping post-sketch ts-apply.sh (no roster file — non-vote install path)"
+      fi
     else
       echo "ERROR: ts-config exited with code ${TS_CONFIG_EXIT} — check logs:"
       echo "       /opt/openrelik-pipeline/logs/ts-config.log"
