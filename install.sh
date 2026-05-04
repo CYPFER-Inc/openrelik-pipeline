@@ -790,12 +790,30 @@ if [ "${INSTALL_OR}" = "true" ]; then
   if [ -f /etc/vote-case.env ]; then
     source /etc/vote-case.env
     if [ -n "${CASE_ID}" ]; then
-      OR_URL="https://${CASE_ID}-or.dev.cypfer.io"
+      OR_URL_LEGACY="https://${CASE_ID}-or.dev.cypfer.io"
+      # Slug subdomain (microcloud slug epic, S1+S2): when /etc/vote-case.env
+      # carries SLUG_OR (set since microcloud PR #187 for new launches), make
+      # the slug URL the canonical OR public URL — matches Authentik's
+      # LAUNCH_URL and avoids the cross-origin bug where the slug-routed UI
+      # tries to reach the legacy API and runs into "no session cookie on
+      # this origin" 401s. Both origins go into allowed_origins so the
+      # CORS preflight tolerates a stale-bookmarked legacy tab.
+      #
+      # Pre-slug cases (CASE_ID launched before slug epic, no SLUG_OR in
+      # /etc/vote-case.env) keep the legacy-only behaviour.
+      if [ -n "${SLUG_OR:-}" ]; then
+        OR_URL="https://${SLUG_OR}.dev.cypfer.io"
+        OR_ALLOWED_ORIGINS="[\"${OR_URL}\", \"${OR_URL_LEGACY}\"]"
+        echo "Configuring OpenRelik for case ${CASE_ID} (slug-canonical: ${SLUG_OR})..."
+      else
+        OR_URL="${OR_URL_LEGACY}"
+        OR_ALLOWED_ORIGINS="[\"${OR_URL}\"]"
+        echo "Configuring OpenRelik for case ${CASE_ID} (legacy URL only — pre-slug case)..."
+      fi
       # TS public hostname follows the same per-case pattern (nginx routes
       # 2078-ts.dev.cypfer.io to the case container's TS). Used by Phase 3
       # AI worker creds in /etc/vote-case-ai.env later in the script.
       TS_URL="https://${CASE_ID}-ts.dev.cypfer.io"
-      echo "Configuring OpenRelik for case ${CASE_ID}..."
 
       # Update config.env and .env
       sed -i "s|OPENRELIK_SERVER_URL=.*|OPENRELIK_SERVER_URL=${OR_URL}|" /opt/openrelik/config.env 2>/dev/null
@@ -808,9 +826,9 @@ if [ "${INSTALL_OR}" = "true" ]; then
       # Update settings.toml
       sed -i "s|api_server_url = .*|api_server_url = \"${OR_URL}\"|" /opt/openrelik/config/settings.toml
       sed -i "s|ui_server_url = .*|ui_server_url = \"${OR_URL}\"|" /opt/openrelik/config/settings.toml
-      sed -i "s|allowed_origins = .*|allowed_origins = [\"${OR_URL}\"]|" /opt/openrelik/config/settings.toml
+      sed -i "s|allowed_origins = .*|allowed_origins = ${OR_ALLOWED_ORIGINS}|" /opt/openrelik/config/settings.toml
 
-      echo "OpenRelik URLs set to ${OR_URL}"
+      echo "OpenRelik URLs set to ${OR_URL} (allowed_origins=${OR_ALLOWED_ORIGINS})"
 
       # ─── OpenRelik OIDC (prod only) ────────────────────────────────────────
       # When AUTHENTIK_OR_CLIENT_ID is set, configure the openrelik-server's
