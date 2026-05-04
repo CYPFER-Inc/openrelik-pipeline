@@ -1297,7 +1297,34 @@ def add_triage_ts_tasks_to_workflow(
             "queue_name": "openrelik-worker-plaso",
             "display_name": "Plaso: Log2Timeline",
             "description": "Super timelining",
-            "task_config": [],
+            # Disable Plaso's filestat parser. Without this, every Plaso
+            # timeline carries thousands of fs:stat events whose `filename`
+            # is the worker's UUID-named internal storage path
+            # (OS:/usr/share/openrelik/data/artifacts/.../...) -- not the
+            # original artefact path. fs:stat is normally 80-95% of a
+            # Plaso timeline; with the OR-scratch-path issue, that's pure
+            # noise that pollutes every analyst's sketch. Verified on
+            # case-2104 (2026-05-01).
+            #
+            # Trade-off: this disables filestat globally for the triage
+            # workflow. We lose legitimate fs:stat events that would
+            # come from raw disk images (where Plaso could see real
+            # filesystem paths via TSK). Today our triage input is always
+            # a KAPE-style triage zip extracted to OR scratch -- there
+            # are no real disk images, so no genuine fs:stat events to
+            # preserve. If we ever ingest raw .E01 / .dd / .vmdk via this
+            # workflow, revisit this filter (per-workflow task_config or
+            # a smarter post-process filter).
+            "task_config": [
+                {
+                    "name": "parsers",
+                    "label": "Plaso parsers",
+                    "description": "Comma-separated parser list with optional `!` negation. Defaults to all parsers minus filestat.",
+                    "type": "text",
+                    "required": False,
+                    "value": "!filestat",
+                }
+            ],
             "type": "task",
             "uuid": f"{plaso_uuid}",
             "tasks": [
