@@ -166,6 +166,41 @@ def test_emit_ai_response_ok(capsys):
     assert "error" not in evt
 
 
+def test_emit_ai_response_input_tokens(capsys):
+    """Authoritative prompt token count is filled on the response event,
+    sourced from response.usage.prompt_tokens — avoids needing a
+    client-side tokenizer in the worker just to populate the audit."""
+    _, evt = _capture_emit(
+        capsys,
+        emit_ai_response,
+        case_id="9998",
+        actor="ai-summary-worker",
+        run_id="abc",
+        response_text="hello world",
+        input_tokens=1843,
+        output_tokens=412,
+        duration_ms=8420,
+    )
+    assert evt["input_tokens"] == 1843
+    assert evt["output_tokens"] == 412
+
+
+def test_emit_ai_response_input_tokens_optional(capsys):
+    """input_tokens unset stays None (matches the ai_prompt event's own
+    null-by-default behaviour pre-tokenizer)."""
+    _, evt = _capture_emit(
+        capsys,
+        emit_ai_response,
+        case_id="9998",
+        actor="ai-summary-worker",
+        run_id="abc",
+        response_text="hello world",
+        output_tokens=412,
+        duration_ms=8420,
+    )
+    assert evt["input_tokens"] is None
+
+
 def test_emit_ai_response_refusal(capsys):
     _, evt = _capture_emit(
         capsys,
