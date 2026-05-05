@@ -1396,6 +1396,33 @@ def _is_archive(filename):
     return any(name.endswith(suf) for suf in _ARCHIVE_SUFFIXES)
 
 
+# Host-artefact extensions that have no business on the network endpoint.
+# Without an upfront reject, the network-normalizer pipeline would happily
+# accept the upload, feed binary EVTX bytes into Logstash as text, and
+# silently produce empty/junk timelines -- the worst kind of failure
+# (data lost, no alarm). Better to fail loud at the route boundary.
+#
+# Conservative list: only formats that ARE actively supported elsewhere
+# in our pipeline (i.e. on /api/triage/timesketch via chainsaw + hayabusa)
+# and whose rejection has a clear "send it over there instead" remediation.
+# Adding more host-artefact extensions later (.pf, .lnk, registry hives,
+# etc.) is fine if they show up as analyst foot-guns; today only EVTX has
+# been observed in this misroute.
+_NETWORK_REJECT_SUFFIXES = (".evtx", ".evtx.gz")
+
+
+def _network_reject_reason(filename):
+    """If `filename` is an obvious host-artefact type that doesn't belong
+    on the network endpoint, return a short error code suitable for the
+    JSON response. Otherwise return None.
+    """
+    name = (filename or "").lower()
+    for suf in _NETWORK_REJECT_SUFFIXES:
+        if name.endswith(suf):
+            return "evtx_not_supported_here"
+    return None
+
+
 def add_network_ts_tasks_to_workflow(
     folder_id,
     workflow_id,
@@ -1786,6 +1813,27 @@ def api_network_timesketch():
 
     file = request.files["file"]
     filename = file.filename
+
+    # Reject obvious host-artefact uploads at the route boundary. Without
+    # this, an EVTX file would flow into the network-normalizer worker,
+    # Logstash would treat the binary bytes as text, and a near-empty
+    # timeline would land in TS with no error. Worst-of-all-worlds:
+    # data lost, no alarm. Fail loud here instead, with a remediation
+    # pointing at the right endpoint.
+    reject_reason = _network_reject_reason(filename)
+    if reject_reason:
+        return jsonify({
+            "error": reject_reason,
+            "message": (
+                f"{filename!r} is a Windows event log -- not a network log. "
+                "EVTX uploads belong on /api/triage/timesketch, which fans "
+                "out to chainsaw + hayabusa for Sigma rule hunting and "
+                "EVTX-aware parsing. The network endpoint feeds the SOF-ELK "
+                "Logstash pipeline, which can't parse Windows binary event "
+                "logs and would silently produce an empty timeline."
+            ),
+        }), 400
+
     timeline_name, _extension = os.path.splitext(filename)
     fqdn, _label = extract_fqdn_and_label(filename)
 
