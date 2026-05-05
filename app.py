@@ -1176,31 +1176,183 @@ def add_triage_ts_tasks_to_workflow(
     sketch_id,
     timeline_name,
     chainsaw_min_level="high",
+    is_archive=True,
 ):
     """
-    Catchall triage workflow: Extract → fan out to every known analyser → each
-    branch uploads its own timeline to Timesketch.
+    Catchall triage workflow: optional extract -> fan out to every known
+    analyser -> each branch uploads its own timeline to Timesketch.
 
-    Layout:
+    Two layouts depending on input shape:
 
-        extract_archive
-          ├── hayabusa csv_timeline        → ts (timeline: "<base> - Hayabusa")
-          ├── chainsaw hunt_evtx           → ts (timeline: "<base> - Chainsaw Sigma")
-          ├── chainsaw builtin_only        → ts (timeline: "<base> - Chainsaw Built-in")
-          ├── chainsaw analyse_srum        → ts (timeline: "<base> - Chainsaw SRUM")
-          └── plaso log2timeline           → ts (timeline: "<base> - Plaso")
+        is_archive=True (.zip / .tar.gz / .7z / ...):
+            extract_archive
+              ├── hayabusa csv_timeline        -> ts (timeline: "<base> - Hayabusa")
+              ├── chainsaw hunt_evtx           -> ts (timeline: "<base> - Chainsaw Sigma")
+              ├── chainsaw builtin_only        -> ts (timeline: "<base> - Chainsaw Built-in")
+              ├── chainsaw analyse_srum        -> ts (timeline: "<base> - Chainsaw SRUM")
+              └── plaso log2timeline           -> ts (timeline: "<base> - Plaso")
 
-    Each worker's compatible-input filter picks up only what it knows and
-    silently no-ops on everything else — there is no pre-classification step.
-    All five branches run in parallel once extraction completes; each writes
-    a separately named timeline into the same sketch (via sketch_id).
+        is_archive=False (.evtx / .log / .pf / loose registry hive / ...):
+            ├── hayabusa csv_timeline    -> ts
+            ├── chainsaw hunt_evtx       -> ts
+            ├── chainsaw builtin_only    -> ts
+            ├── chainsaw analyse_srum    -> ts
+            └── plaso log2timeline       -> ts
+
+    The plain-input branch skips extract_archive because the extraction
+    worker invokes 7zip then tar and raises on non-archive input
+    ("7zip or tar execution error."). Mirrors the same conditional that
+    PR #73 added to the network endpoint -- typical analyst use case is
+    a single loose .evtx or .pf dropped in for ad-hoc inspection.
+
+    Each worker's compatible-input filter picks up only what it knows
+    and silently no-ops on everything else -- so a bare .log fed to
+    triage will fan out to all five analysers but only plaso (which
+    parses many text-log shapes) will likely produce events. That's
+    consistent with how the network endpoint behaves and never
+    hard-errors.
     """
-    extraction_uuid = str(uuid.uuid4()).replace("-", "")
     hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_builtin_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
     plaso_uuid = str(uuid.uuid4()).replace("-", "")
+
+    analyser_branches = [
+        {
+            "task_name": "openrelik-worker-hayabusa.tasks.csv_timeline",
+            "queue_name": "openrelik-worker-hayabusa",
+            "display_name": "Hayabusa CSV timeline",
+            "description": "Windows event log triage",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{hayabusa_uuid}",
+            "tasks": [
+                _ts_leaf(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - Hayabusa",
+                )
+            ],
+        },
+        {
+            "task_name": "openrelik-worker-chainsaw.tasks.hunt_evtx",
+            "queue_name": "openrelik-worker-chainsaw",
+            "display_name": "Chainsaw: Hunt EVTX (Sigma + built-ins)",
+            "description": "Run SigmaHQ + Chainsaw built-in rules against EVTX",
+            "task_config": [
+                {
+                    "name": "min_level",
+                    "label": "Minimum detection level",
+                    "description": "Restrict loaded Sigma rules to this level or higher",
+                    "type": "select",
+                    "required": False,
+                    "value": f"{chainsaw_min_level}",
+                }
+            ],
+            "type": "task",
+            "uuid": f"{chainsaw_hunt_uuid}",
+            "tasks": [
+                _ts_leaf(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - Chainsaw Sigma",
+                )
+            ],
+        },
+        {
+            "task_name": "openrelik-worker-chainsaw.tasks.builtin_only",
+            "queue_name": "openrelik-worker-chainsaw",
+            "display_name": "Chainsaw: Built-in rules only",
+            "description": "Chainsaw built-in rules (AV alerts, log-clearing) without Sigma",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{chainsaw_builtin_uuid}",
+            "tasks": [
+                _ts_leaf(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - Chainsaw Built-in",
+                )
+            ],
+        },
+        {
+            "task_name": "openrelik-worker-chainsaw.tasks.analyse_srum",
+            "queue_name": "openrelik-worker-chainsaw",
+            "display_name": "Chainsaw: Analyse SRUM database",
+            "description": "Parse SRUDB.dat (requires SOFTWARE hive in the same input set)",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{chainsaw_srum_uuid}",
+            "tasks": [
+                _ts_leaf(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - Chainsaw SRUM",
+                )
+            ],
+        },
+        {
+            "task_name": "openrelik-worker-plaso.tasks.log2timeline",
+            "queue_name": "openrelik-worker-plaso",
+            "display_name": "Plaso: Log2Timeline",
+            "description": "Super timelining",
+            # Disable Plaso's filestat parser. Without this, every Plaso
+            # timeline carries thousands of fs:stat events whose `filename`
+            # is the worker's UUID-named internal storage path
+            # (OS:/usr/share/openrelik/data/artifacts/.../...) -- not the
+            # original artefact path. fs:stat is normally 80-95% of a
+            # Plaso timeline; with the OR-scratch-path issue, that's pure
+            # noise that pollutes every analyst's sketch. Verified on
+            # case-2104 (2026-05-01).
+            #
+            # Trade-off: this disables filestat globally for the triage
+            # workflow. We lose legitimate fs:stat events that would
+            # come from raw disk images (where Plaso could see real
+            # filesystem paths via TSK). Today our triage input is always
+            # a KAPE-style triage zip extracted to OR scratch -- there
+            # are no real disk images, so no genuine fs:stat events to
+            # preserve. If we ever ingest raw .E01 / .dd / .vmdk via this
+            # workflow, revisit this filter (per-workflow task_config or
+            # a smarter post-process filter).
+            "task_config": [
+                {
+                    "name": "parsers",
+                    "label": "Plaso parsers",
+                    "description": "Comma-separated parser list with optional `!` negation. Defaults to all parsers minus filestat.",
+                    "type": "text",
+                    "required": False,
+                    "value": "!filestat",
+                }
+            ],
+            "type": "task",
+            "uuid": f"{plaso_uuid}",
+            "tasks": [
+                _ts_leaf(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - Plaso",
+                )
+            ],
+        },
+    ]
+
+    if is_archive:
+        extraction_uuid = str(uuid.uuid4()).replace("-", "")
+        root_tasks = [
+            {
+                "task_name": "openrelik-worker-extraction.tasks.extract_archive",
+                "queue_name": "openrelik-worker-extraction",
+                "display_name": "Extract Archives",
+                "description": "Extract files from archive for downstream analysers",
+                "task_config": [],
+                "type": "task",
+                "uuid": f"{extraction_uuid}",
+                "tasks": analyser_branches,
+            }
+        ]
+    else:
+        root_tasks = analyser_branches
 
     workflow_spec = {
         "spec_json": json.dumps(
@@ -1208,108 +1360,7 @@ def add_triage_ts_tasks_to_workflow(
                 "workflow": {
                     "type": "chain",
                     "isRoot": True,
-                    "tasks": [
-                        {
-                            "task_name": "openrelik-worker-extraction.tasks.extract_archive",
-                            "queue_name": "openrelik-worker-extraction",
-                            "display_name": "Extract Archives",
-                            "description": "Extract files from archive for downstream analysers",
-                            "task_config": [],
-                            "type": "task",
-                            "uuid": f"{extraction_uuid}",
-                            "tasks": [
-                                {
-                                    "task_name": "openrelik-worker-hayabusa.tasks.csv_timeline",
-                                    "queue_name": "openrelik-worker-hayabusa",
-                                    "display_name": "Hayabusa CSV timeline",
-                                    "description": "Windows event log triage",
-                                    "task_config": [],
-                                    "type": "task",
-                                    "uuid": f"{hayabusa_uuid}",
-                                    "tasks": [
-                                        _ts_leaf(
-                                            sketch_name,
-                                            sketch_id,
-                                            f"{timeline_name} - Hayabusa",
-                                        )
-                                    ],
-                                },
-                                {
-                                    "task_name": "openrelik-worker-chainsaw.tasks.hunt_evtx",
-                                    "queue_name": "openrelik-worker-chainsaw",
-                                    "display_name": "Chainsaw: Hunt EVTX (Sigma + built-ins)",
-                                    "description": "Run SigmaHQ + Chainsaw built-in rules against EVTX",
-                                    "task_config": [
-                                        {
-                                            "name": "min_level",
-                                            "label": "Minimum detection level",
-                                            "description": "Restrict loaded Sigma rules to this level or higher",
-                                            "type": "select",
-                                            "required": False,
-                                            "value": f"{chainsaw_min_level}",
-                                        }
-                                    ],
-                                    "type": "task",
-                                    "uuid": f"{chainsaw_hunt_uuid}",
-                                    "tasks": [
-                                        _ts_leaf(
-                                            sketch_name,
-                                            sketch_id,
-                                            f"{timeline_name} - Chainsaw Sigma",
-                                        )
-                                    ],
-                                },
-                                {
-                                    "task_name": "openrelik-worker-chainsaw.tasks.builtin_only",
-                                    "queue_name": "openrelik-worker-chainsaw",
-                                    "display_name": "Chainsaw: Built-in rules only",
-                                    "description": "Chainsaw built-in rules (AV alerts, log-clearing) without Sigma",
-                                    "task_config": [],
-                                    "type": "task",
-                                    "uuid": f"{chainsaw_builtin_uuid}",
-                                    "tasks": [
-                                        _ts_leaf(
-                                            sketch_name,
-                                            sketch_id,
-                                            f"{timeline_name} - Chainsaw Built-in",
-                                        )
-                                    ],
-                                },
-                                {
-                                    "task_name": "openrelik-worker-chainsaw.tasks.analyse_srum",
-                                    "queue_name": "openrelik-worker-chainsaw",
-                                    "display_name": "Chainsaw: Analyse SRUM database",
-                                    "description": "Parse SRUDB.dat (requires SOFTWARE hive in the same input set)",
-                                    "task_config": [],
-                                    "type": "task",
-                                    "uuid": f"{chainsaw_srum_uuid}",
-                                    "tasks": [
-                                        _ts_leaf(
-                                            sketch_name,
-                                            sketch_id,
-                                            f"{timeline_name} - Chainsaw SRUM",
-                                        )
-                                    ],
-                                },
-                                {
-                                    "task_name": "openrelik-worker-plaso.tasks.log2timeline",
-                                    "queue_name": "openrelik-worker-plaso",
-                                    "display_name": "Plaso: Log2Timeline",
-                                    "description": "Super timelining",
-                                    "task_config": [],
-                                    "type": "task",
-                                    "uuid": f"{plaso_uuid}",
-                                    "tasks": [
-                                        _ts_leaf(
-                                            sketch_name,
-                                            sketch_id,
-                                            f"{timeline_name} - Plaso",
-                                        )
-                                    ],
-                                },
-                            ],
-                        }
-                    ],
+                    "tasks": root_tasks,
                 }
             }
         )
@@ -1320,25 +1371,56 @@ def add_triage_ts_tasks_to_workflow(
 
 # Archive extensions handled by openrelik-worker-extraction's
 # extract_archive_task (7zip + tar). Anything outside this set is
-# treated as a plain log and bypasses extraction entirely — feeding a
+# treated as a plain file and bypasses extraction entirely — feeding a
 # bare .log into the extraction worker raises
 # RuntimeError("7zip or tar execution error.") because neither tool
 # recognises it as an archive.
-_NETWORK_ARCHIVE_SUFFIXES = (
+#
+# Used by both the network endpoint (PR #73) and the triage endpoint --
+# the archive-detection logic is generic, not pipeline-specific.
+_ARCHIVE_SUFFIXES = (
     ".zip", ".7z", ".rar",
     ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz",
     ".gz", ".bz2", ".xz",
 )
 
 
-def _is_network_archive(filename):
+def _is_archive(filename):
     """True if `filename` looks like an archive that the extraction
-    worker can unpack. Plain logs (.log, .txt, .syslog, .json, .csv,
-    .ndjson, no-extension) return False so the network workflow skips
-    extract_archive and feeds the file straight into the normalizer.
+    worker can unpack. Plain files (.log, .txt, .syslog, .json, .csv,
+    .ndjson, no-extension, .evtx, etc.) return False so the calling
+    workflow skips extract_archive and feeds the file straight into
+    the analyser chain.
     """
     name = (filename or "").lower()
-    return any(name.endswith(suf) for suf in _NETWORK_ARCHIVE_SUFFIXES)
+    return any(name.endswith(suf) for suf in _ARCHIVE_SUFFIXES)
+
+
+# Host-artefact extensions that have no business on the network endpoint.
+# Without an upfront reject, the network-normalizer pipeline would happily
+# accept the upload, feed binary EVTX bytes into Logstash as text, and
+# silently produce empty/junk timelines -- the worst kind of failure
+# (data lost, no alarm). Better to fail loud at the route boundary.
+#
+# Conservative list: only formats that ARE actively supported elsewhere
+# in our pipeline (i.e. on /api/triage/timesketch via chainsaw + hayabusa)
+# and whose rejection has a clear "send it over there instead" remediation.
+# Adding more host-artefact extensions later (.pf, .lnk, registry hives,
+# etc.) is fine if they show up as analyst foot-guns; today only EVTX has
+# been observed in this misroute.
+_NETWORK_REJECT_SUFFIXES = (".evtx", ".evtx.gz")
+
+
+def _network_reject_reason(filename):
+    """If `filename` is an obvious host-artefact type that doesn't belong
+    on the network endpoint, return a short error code suitable for the
+    JSON response. Otherwise return None.
+    """
+    name = (filename or "").lower()
+    for suf in _NETWORK_REJECT_SUFFIXES:
+        if name.endswith(suf):
+            return "evtx_not_supported_here"
+    return None
 
 
 def add_network_ts_tasks_to_workflow(
@@ -1675,8 +1757,10 @@ def api_triage_timesketch():
     rename_folder(workflow_folder_id, f"{filename} Triage Workflow Folder")
     rename_workflow(folder_id, workflow_id, f"{filename} Triage Workflow")
 
+    is_archive = _is_archive(filename)
     add_triage_ts_tasks_to_workflow(
-        folder_id, workflow_id, sketch_name, sketch_id, timeline_name
+        folder_id, workflow_id, sketch_name, sketch_id, timeline_name,
+        is_archive=is_archive,
     )
     run = run_workflow(folder_id, workflow_id)
 
@@ -1686,6 +1770,7 @@ def api_triage_timesketch():
             "case_id": case_id or None,
             "case_folder_id": folder_id if case_id else None,
             "workflow_id": workflow_id,
+            "extracted": is_archive,
             "run_details": run,
         }
     )
@@ -1728,6 +1813,27 @@ def api_network_timesketch():
 
     file = request.files["file"]
     filename = file.filename
+
+    # Reject obvious host-artefact uploads at the route boundary. Without
+    # this, an EVTX file would flow into the network-normalizer worker,
+    # Logstash would treat the binary bytes as text, and a near-empty
+    # timeline would land in TS with no error. Worst-of-all-worlds:
+    # data lost, no alarm. Fail loud here instead, with a remediation
+    # pointing at the right endpoint.
+    reject_reason = _network_reject_reason(filename)
+    if reject_reason:
+        return jsonify({
+            "error": reject_reason,
+            "message": (
+                f"{filename!r} is a Windows event log -- not a network log. "
+                "EVTX uploads belong on /api/triage/timesketch, which fans "
+                "out to chainsaw + hayabusa for Sigma rule hunting and "
+                "EVTX-aware parsing. The network endpoint feeds the SOF-ELK "
+                "Logstash pipeline, which can't parse Windows binary event "
+                "logs and would silently produce an empty timeline."
+            ),
+        }), 400
+
     timeline_name, _extension = os.path.splitext(filename)
     fqdn, _label = extract_fqdn_and_label(filename)
 
@@ -1757,7 +1863,7 @@ def api_network_timesketch():
     rename_folder(workflow_folder_id, f"{filename} Network Workflow Folder")
     rename_workflow(folder_id, workflow_id, f"{filename} Network Workflow")
 
-    is_archive = _is_network_archive(filename)
+    is_archive = _is_archive(filename)
     add_network_ts_tasks_to_workflow(
         folder_id, workflow_id, sketch_name, sketch_id, timeline_name,
         is_archive=is_archive,

@@ -129,6 +129,7 @@ def emit_ai_response(
     actor: str,
     run_id: str,
     response_text: Optional[str] = None,
+    input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     duration_ms: Optional[int] = None,
     refusal: bool = False,
@@ -151,7 +152,14 @@ def emit_ai_response(
         run_id: matching `ai_prompt` run_id.
         response_text: full model output. Used to compute
             `response_sha256`. None on error (no output to hash).
-        output_tokens: token count if known.
+        input_tokens: prompt token count, captured authoritatively from
+            the model's response.usage.prompt_tokens. Filling this on
+            the response (rather than the prompt) avoids needing a
+            client-side tokenizer dependency in the worker just to
+            populate the audit event. The matching `ai_prompt` event
+            for the same `run_id` may have `input_tokens=None` —
+            consumers wanting the count should read it off this event.
+        output_tokens: completion token count if known.
         duration_ms: wall time of the model call in ms (proxy round-trip).
         refusal: True if refusal-detection flagged the output. Drives
             the verdict label used by Grafana refusal-rate panels.
@@ -174,6 +182,7 @@ def emit_ai_response(
         "run_id": run_id,
         "duration_ms": duration_ms,
         "refusal": refusal,
+        "input_tokens": input_tokens,
     }
     if response_text is not None:
         obj["output_tokens"] = output_tokens
