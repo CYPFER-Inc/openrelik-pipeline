@@ -1186,13 +1186,15 @@ def add_triage_ts_tasks_to_workflow(
 
         is_archive=True (.zip / .tar.gz / .7z / ...):
             extract_archive
-              ├── hayabusa csv_timeline        -> ts (timeline: "<base> - Hayabusa")
-              ├── chainsaw hunt_evtx           -> ts (timeline: "<base> - Chainsaw Sigma")
-              ├── chainsaw builtin_only        -> ts (timeline: "<base> - Chainsaw Built-in")
-              ├── chainsaw analyse_srum        -> ts (timeline: "<base> - Chainsaw SRUM")
-              └── plaso log2timeline           -> ts (timeline: "<base> - Plaso")
+              ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
+              ├── hayabusa csv_timeline          -> ts (timeline: "<base> - Hayabusa")
+              ├── chainsaw hunt_evtx             -> ts (timeline: "<base> - Chainsaw Sigma")
+              ├── chainsaw builtin_only          -> ts (timeline: "<base> - Chainsaw Built-in")
+              ├── chainsaw analyse_srum          -> ts (timeline: "<base> - Chainsaw SRUM")
+              └── plaso log2timeline             -> ts (timeline: "<base> - Plaso")
 
         is_archive=False (.evtx / .log / .pf / loose registry hive / ...):
+            ├── derive_id (host-fingerprint)
             ├── hayabusa csv_timeline    -> ts
             ├── chainsaw hunt_evtx       -> ts
             ├── chainsaw builtin_only    -> ts
@@ -1211,12 +1213,24 @@ def add_triage_ts_tasks_to_workflow(
     parses many text-log shapes) will likely produce events. That's
     consistent with how the network endpoint behaves and never
     hard-errors.
+
+    Host-fingerprint integration (PR 3 of the rollout):
+    `derive_id` is added as a SIBLING branch (parallel to the
+    analysers, not a parent), so it runs alongside without gating
+    fan-out. It produces a sidecar JSON tagged
+    `data_type=openrelik:host-fingerprint:sidecar` that's visible in
+    the OR UI and queryable by analysts. Stamper integration
+    (`stamp_csv` between hayabusa and ts.upload, `stamp_jsonl` between
+    plaso and ts.upload) is PR 4 of the rollout once the sidecar
+    consumption pattern is settled. Until PR 4, only chainsaw events
+    carry `host.id` (chainsaw self-derives via PR #8 of its own repo).
     """
     hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_builtin_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
     plaso_uuid = str(uuid.uuid4()).replace("-", "")
+    host_fingerprint_uuid = str(uuid.uuid4()).replace("-", "")
 
     analyser_branches = [
         {
@@ -1334,6 +1348,22 @@ def add_triage_ts_tasks_to_workflow(
                     f"{timeline_name} - Plaso",
                 )
             ],
+        },
+        # Host-fingerprint sibling (PR 3 of the rollout). Runs in
+        # parallel with the analysers; produces a sidecar JSON that
+        # downstream stamper tasks (PR 4) will consume to add host.id
+        # to upstream worker output. No `tasks: [...]` -- this branch
+        # has no children today; sidecar is its only artefact and
+        # lands in the workflow folder.
+        {
+            "task_name": "openrelik-worker-host-fingerprint.tasks.derive_id",
+            "queue_name": "openrelik-worker-host-fingerprint",
+            "display_name": "Host Fingerprint: derive host.id",
+            "description": "Derive a per-collection host.id (MachineGuid + filename heuristics) from extracted forensic input; emit sidecar JSON for cross-pipeline correlation.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{host_fingerprint_uuid}",
+            "tasks": [],
         },
     ]
 
