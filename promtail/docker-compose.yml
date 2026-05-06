@@ -37,6 +37,14 @@ services:
       # install.audit.log is JSON-per-line; rotated master install.log in
       # the same dir is also available if a future PR wants to ship it.
       - /opt/openrelik-pipeline/logs:/opt/openrelik-pipeline/logs:ro
+      # /var/log is needed for the Phase 4B authentik-sync reconciler
+      # tick log (/var/log/authentik-sync.log -- one JSON line / 60s).
+      # Read-only mount, same convention as nginx-server / services-1
+      # promtail variants. Without this, the authentik-sync scrape job
+      # silently never finds the file and Loki gets no reconciler ticks
+      # -- the authentik-sync-tick-stalled alert can't fire either,
+      # since it detects via absence-of-series.
+      - /var/log:/var/log:ro
       - ./promtail-config.yaml:/etc/promtail/config.yaml:ro
       - ./positions:/positions
     # Scratch image has no wget/curl — bind health port on localhost

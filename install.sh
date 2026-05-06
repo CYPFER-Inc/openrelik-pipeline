@@ -745,6 +745,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
       "${VR_CONFIG_IMAGE:-ghcr.io/cypfer-inc/openrelik-vr-config:latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-host-fingerprint:${OPENRELIK_WORKER_HOST_FINGERPRINT_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
       MIRRORED=$(mirror_image "${img}")
       echo "  Pulling ${MIRRORED}..."
@@ -1342,6 +1343,19 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-chainsaw failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-chainsaw"
+  fi
+
+  # Start the host-fingerprint worker (per-collection host.id derivation)
+  # Same pattern as llm-summary -- compose block written by or-config's
+  # configure.py from workers/openrelik-worker-host-fingerprint.yml; we
+  # just bring the container up + verify it's running.
+  docker compose up -d openrelik-worker-host-fingerprint 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-host-fingerprint"; then
+    echo "openrelik-worker-host-fingerprint is running"
+  else
+    echo "WARNING: openrelik-worker-host-fingerprint failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-host-fingerprint"
   fi
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
