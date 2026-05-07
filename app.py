@@ -1171,6 +1171,58 @@ def _ts_leaf(sketch_name, sketch_id, timeline_name):
     }
 
 
+def _stamp_then_ts(stamp_task_name, sketch_name, sketch_id, timeline_name):
+    """Return a stamp_X -> ts.upload sub-tree.
+
+    Inserts the host-fingerprint stamper between an analyser branch and
+    the Timesketch upload, so every event in the resulting timeline
+    carries the full ECS host.* set (host.id + host.fqdn + host.name +
+    host.machine_guid + host.vr_client_id + host.mac, where populated)
+    propagated from the sidecar emitted by the derive_id sibling task.
+
+    The stamper finds the sidecar at runtime via the OR file API
+    (data_type=openrelik:host-fingerprint:sidecar). If no sidecar is
+    available -- e.g. derive_id failed, or this workflow isn't a
+    triage-from-VR shape -- the stamper passes the analyser output
+    through verbatim and the ts.upload step still runs.
+
+    Used by the Hayabusa (CSV) and Plaso / Chainsaw (JSONL) branches.
+    """
+    return {
+        "task_name": stamp_task_name,
+        "queue_name": "openrelik-worker-host-fingerprint",
+        "display_name": (
+            "Host Fingerprint: stamp host.* on CSV"
+            if "stamp_csv" in stamp_task_name
+            else "Host Fingerprint: stamp host.* on JSONL"
+        ),
+        "description": (
+            "Append ECS host.* columns / fields from the derive_id sidecar "
+            "to every event before Timesketch upload."
+        ),
+        "task_config": [],
+        "type": "task",
+        "uuid": str(uuid.uuid4()).replace("-", ""),
+        "tasks": [
+            _ts_leaf(sketch_name, sketch_id, timeline_name),
+        ],
+    }
+
+
+def _stamp_csv_then_ts(sketch_name, sketch_id, timeline_name):
+    return _stamp_then_ts(
+        "openrelik-worker-host-fingerprint.tasks.stamp_csv",
+        sketch_name, sketch_id, timeline_name,
+    )
+
+
+def _stamp_jsonl_then_ts(sketch_name, sketch_id, timeline_name):
+    return _stamp_then_ts(
+        "openrelik-worker-host-fingerprint.tasks.stamp_jsonl",
+        sketch_name, sketch_id, timeline_name,
+    )
+
+
 def add_triage_ts_tasks_to_workflow(
     folder_id,
     workflow_id,
@@ -1189,19 +1241,14 @@ def add_triage_ts_tasks_to_workflow(
         is_archive=True (.zip / .tar.gz / .7z / ...):
             extract_archive
               ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
-              ├── hayabusa csv_timeline          -> ts (timeline: "<base> - Hayabusa")
-              ├── chainsaw hunt_evtx             -> ts (timeline: "<base> - Chainsaw Sigma")
-              ├── chainsaw builtin_only          -> ts (timeline: "<base> - Chainsaw Built-in")
-              ├── chainsaw analyse_srum          -> ts (timeline: "<base> - Chainsaw SRUM")
-              └── plaso log2timeline             -> ts (timeline: "<base> - Plaso")
+              ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
+              ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
+              ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
+              ├── chainsaw analyse_srum   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw SRUM")
+              └── plaso log2timeline      -> stamp_jsonl -> ts (timeline: "<base> - Plaso")
 
         is_archive=False (.evtx / .log / .pf / loose registry hive / ...):
-            ├── derive_id (host-fingerprint)
-            ├── hayabusa csv_timeline    -> ts
-            ├── chainsaw hunt_evtx       -> ts
-            ├── chainsaw builtin_only    -> ts
-            ├── chainsaw analyse_srum    -> ts
-            └── plaso log2timeline       -> ts
+            Same shape, no extract_archive parent.
 
     The plain-input branch skips extract_archive because the extraction
     worker invokes 7zip then tar and raises on non-archive input
@@ -1216,16 +1263,22 @@ def add_triage_ts_tasks_to_workflow(
     consistent with how the network endpoint behaves and never
     hard-errors.
 
-    Host-fingerprint integration (PR 3 of the rollout):
+    Host-fingerprint integration (PR 3 + PR 4 of the rollout):
     `derive_id` is added as a SIBLING branch (parallel to the
     analysers, not a parent), so it runs alongside without gating
     fan-out. It produces a sidecar JSON tagged
     `data_type=openrelik:host-fingerprint:sidecar` that's visible in
-    the OR UI and queryable by analysts. Stamper integration
-    (`stamp_csv` between hayabusa and ts.upload, `stamp_jsonl` between
-    plaso and ts.upload) is PR 4 of the rollout once the sidecar
-    consumption pattern is settled. Until PR 4, only chainsaw events
-    carry `host.id` (chainsaw self-derives via PR #8 of its own repo).
+    the OR UI and queryable by analysts.
+
+    `stamp_csv` (between hayabusa and ts.upload) and `stamp_jsonl`
+    (between plaso / chainsaw branches and ts.upload) propagate the
+    full ECS host.* set onto every event:
+        host.id, host.fqdn, host.name, host.machine_guid,
+        host.vr_client_id, host.mac (where populated).
+    Sidecar is canonical -- if any analyser already wrote one of those
+    fields (e.g. chainsaw self-derives host.id via PR #8 of its repo),
+    the stamper overwrites it for single-source-of-truth across all
+    triage branches.
     """
     hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
@@ -1244,7 +1297,10 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{hayabusa_uuid}",
             "tasks": [
-                _ts_leaf(
+                # Hayabusa output is CSV -> stamp_csv -> ts.upload.
+                # Stamper appends ECS host.* columns to every row from
+                # the derive_id sidecar before TS ingestion.
+                _stamp_csv_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Hayabusa",
@@ -1269,7 +1325,11 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{chainsaw_hunt_uuid}",
             "tasks": [
-                _ts_leaf(
+                # Chainsaw outputs JSONL via timesketch_mapper. Stamper
+                # overwrites chainsaw's self-derived host.id (PR #8 of
+                # chainsaw worker) with the sidecar value -- single
+                # source of truth across all triage branches.
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw Sigma",
@@ -1285,7 +1345,7 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{chainsaw_builtin_uuid}",
             "tasks": [
-                _ts_leaf(
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw Built-in",
@@ -1301,7 +1361,7 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{chainsaw_srum_uuid}",
             "tasks": [
-                _ts_leaf(
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw SRUM",
@@ -1344,7 +1404,11 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{plaso_uuid}",
             "tasks": [
-                _ts_leaf(
+                # Plaso super-timeline is JSONL -> stamp_jsonl -> ts.
+                # Without this, every Plaso event in TS has host.id=null
+                # because Plaso doesn't carry hostname-aware fields the
+                # way EVTX-based analysers (chainsaw) do.
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Plaso",
