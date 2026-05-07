@@ -1179,6 +1179,7 @@ def add_triage_ts_tasks_to_workflow(
     timeline_name,
     chainsaw_min_level="high",
     is_archive=True,
+    source_archive_name=None,
 ):
     """
     Catchall triage workflow: optional extract -> fan out to every known
@@ -1357,12 +1358,32 @@ def add_triage_ts_tasks_to_workflow(
         # to upstream worker output. No `tasks: [...]` -- this branch
         # has no children today; sidecar is its only artefact and
         # lands in the workflow folder.
+        #
+        # source_archive_name passes the original upload filename
+        # through to derive_id's Tier-4 filename heuristic. Without it,
+        # the worker only sees OR-renamed UUID basenames and Tier-4
+        # never fires -- caught during case-2133 sidecar inspection
+        # where every host.* field came back null. The worker's
+        # Tier-4-VR regex parses HOST_<fqdn>_<8hex>_<label>.zip into
+        # host.fqdn / host.vr_client_id; the legacy regex handles
+        # vr_kapefiles_<fqdn>_<label>.zip for pre-cutover collections.
         {
             "task_name": "openrelik-worker-host-fingerprint.tasks.derive_id",
             "queue_name": "openrelik-worker-host-fingerprint",
             "display_name": "Host Fingerprint: derive host.id",
             "description": "Derive a per-collection host.id (MachineGuid + filename heuristics) from extracted forensic input; emit sidecar JSON for cross-pipeline correlation.",
-            "task_config": [],
+            "task_config": (
+                [
+                    {
+                        "name": "source_archive_name",
+                        "type": "string",
+                        "required": False,
+                        "value": source_archive_name,
+                    }
+                ]
+                if source_archive_name
+                else []
+            ),
             "type": "task",
             "uuid": f"{host_fingerprint_uuid}",
             "tasks": [],
@@ -1790,6 +1811,12 @@ def api_triage_timesketch():
     add_triage_ts_tasks_to_workflow(
         folder_id, workflow_id, sketch_name, sketch_id, timeline_name,
         is_archive=is_archive,
+        # Pass the original upload filename through to derive_id so its
+        # Tier-4 filename heuristic can extract FQDN + VR client_id from
+        # the HOST_<fqdn>_<8hex>_<label>.zip pattern. Without this,
+        # derive_id only sees OR-renamed UUID basenames and Tier-4
+        # never fires.
+        source_archive_name=filename,
     )
     run = run_workflow(folder_id, workflow_id)
 
