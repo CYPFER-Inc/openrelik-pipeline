@@ -14,6 +14,8 @@ from openrelik_api_client.api_client import APIClient
 from openrelik_api_client.folders import FoldersAPI
 from openrelik_api_client.workflows import WorkflowsAPI
 
+from safe_upload import safe_upload_path as _safe_upload_path
+
 # --------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------
@@ -1641,8 +1643,7 @@ def api_hayabusa_timesketch():
     file = request.files["file"]
     filename = file.filename
     timeline_name, extension = os.path.splitext(filename)
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
     fqdn, label = extract_fqdn_and_label(filename)
 
     # Always send to sketch 1 (created by ts-config on install)
@@ -1686,8 +1687,7 @@ def api_hayabusa():
     file = request.files["file"]
     filename = file.filename
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     folder_id = create_folder(f"{filename} Hayabusa Timelines")
     file_id = upload_file(file_path, folder_id)
@@ -1768,8 +1768,7 @@ def api_triage_timesketch():
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     if case_id:
         folder_id = find_or_create_case_folder(case_id)
@@ -1877,8 +1876,7 @@ def api_network_timesketch():
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     if case_id:
         folder_id = find_or_create_case_folder(case_id)
@@ -1931,8 +1929,7 @@ def api_plaso_timesketch():
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""  # not used when sketch_id is set
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     folder_id = create_folder(f"{filename} Plaso Timeline")
     file_id = upload_file(file_path, folder_id)
@@ -1969,8 +1966,7 @@ def api_plaso():
     file = request.files["file"]
     filename = file.filename
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     folder_id = create_folder(f"{filename} Plaso Timeline")
     file_id = upload_file(file_path, folder_id)
