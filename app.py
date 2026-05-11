@@ -1223,6 +1223,60 @@ def _stamp_jsonl_then_ts(sketch_name, sketch_id, timeline_name):
     )
 
 
+# Phase B of the high-value-artefacts ticket: surface each of these
+# Plaso parsers as its own TS timeline instead of leaving them buried
+# in the super-timeline. Order: (plaso_parser, analyst-facing label).
+#
+# Adding an entry here adds a new sibling branch under Plaso. The
+# split task filters Plaso's super-timeline JSONL down to one
+# parser, then the shared stamp_jsonl -> ts.upload chain stamps the
+# ECS host.* set and uploads as a named timeline. Mirror in
+# openrelik-worker-host-fingerprint's PLASO_SPLIT_TIMELINES dict so
+# the two stay in sync (worker only cares about the parser-name key;
+# pipeline owns the timeline label here).
+_PLASO_SPLIT_PARSERS = [
+    ("amcache",            "AmCache (Program Execution)"),
+    ("appcompatcache",     "ShimCache"),
+    ("bam",                "BAM / DAM (Background Activity)"),
+    ("winjob",             "Scheduled Tasks"),
+    ("powershell_console", "PowerShell History"),
+    ("activities_cache",   "Windows Timeline (Activities Cache)"),
+    ("userassist",         "UserAssist / Recent Apps"),
+]
+
+
+def _plaso_split_then_stamp_then_ts(
+    sketch_name, sketch_id, timeline_name_base, parser, parser_label,
+):
+    """Return a split_jsonl_by_parser -> stamp_jsonl -> ts.upload
+    sub-tree for one Phase B parser. Used as a sibling of Plaso's
+    direct ts.upload branch so the super-timeline still lands AND the
+    split timeline lands."""
+    timeline_name = f"{timeline_name_base} - {parser_label}"
+    return {
+        "task_name": "openrelik-worker-host-fingerprint.tasks.split_jsonl_by_parser",
+        "queue_name": "openrelik-worker-host-fingerprint",
+        "display_name": f"Plaso split: {parser_label}",
+        "description": (
+            f"Filter Plaso super-timeline JSONL to events from parser "
+            f"`{parser}` for the {parser_label} TimeSketch timeline."
+        ),
+        "task_config": [
+            {
+                "name": "parser",
+                "type": "string",
+                "required": True,
+                "value": parser,
+            }
+        ],
+        "type": "task",
+        "uuid": str(uuid.uuid4()).replace("-", ""),
+        "tasks": [
+            _stamp_jsonl_then_ts(sketch_name, sketch_id, timeline_name),
+        ],
+    }
+
+
 def add_triage_ts_tasks_to_workflow(
     folder_id,
     workflow_id,
@@ -1246,7 +1300,15 @@ def add_triage_ts_tasks_to_workflow(
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
               ├── chainsaw analyse_srum   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw SRUM")
-              └── plaso log2timeline      -> stamp_jsonl -> ts (timeline: "<base> - Plaso")
+              └── plaso log2timeline
+                    ├── stamp_jsonl -> ts ("<base> - Plaso" -- the super-timeline)
+                    ├── split[amcache]            -> stamp_jsonl -> ts ("<base> - AmCache ...")
+                    ├── split[appcompatcache]     -> stamp_jsonl -> ts ("<base> - ShimCache")
+                    ├── split[bam]                -> stamp_jsonl -> ts ("<base> - BAM / DAM ...")
+                    ├── split[winjob]             -> stamp_jsonl -> ts ("<base> - Scheduled Tasks")
+                    ├── split[powershell_console] -> stamp_jsonl -> ts ("<base> - PowerShell History")
+                    ├── split[activities_cache]   -> stamp_jsonl -> ts ("<base> - Windows Timeline ...")
+                    └── split[userassist]         -> stamp_jsonl -> ts ("<base> - UserAssist ...")
 
         is_archive=False (.evtx / .log / .pf / loose registry hive / ...):
             Same shape, no extract_archive parent.
@@ -1413,7 +1475,25 @@ def add_triage_ts_tasks_to_workflow(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Plaso",
-                )
+                ),
+                # Phase B of the high-value-artefacts ticket: surface
+                # each high-value parser-class as its own TS timeline
+                # alongside the super-timeline above. Each split task
+                # filters Plaso's JSONL down to one parser; the result
+                # flows through stamp_jsonl -> ts.upload like every
+                # other branch, so split timelines carry the same ECS
+                # host.* set.
+                #
+                # Adding a parser here adds a new timeline. Keep the
+                # list in sync with PLASO_SPLIT_TIMELINES in
+                # openrelik-worker-host-fingerprint's host_id_helpers.
+                *[
+                    _plaso_split_then_stamp_then_ts(
+                        sketch_name, sketch_id, timeline_name,
+                        parser=parser, parser_label=parser_label,
+                    )
+                    for parser, parser_label in _PLASO_SPLIT_PARSERS
+                ],
             ],
         },
         # Host-fingerprint sibling (PR 3 of the rollout). Runs in
