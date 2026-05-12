@@ -1458,10 +1458,16 @@ def add_triage_ts_tasks_to_workflow(
                 {
                     "name": "parsers",
                     "label": "Plaso parsers",
-                    "description": "Comma-separated parser list with optional `!` negation. Defaults to all parsers minus filestat.",
+                    "description": "List of parser names with optional `!` negation. Defaults to all parsers minus filestat.",
                     "type": "text",
                     "required": False,
-                    "value": "!filestat",
+                    # Must be a list, not a string: openrelik-worker-plaso
+                    # does `",".join(task_config["parsers"])` -- a bare
+                    # string is iterated char-by-char and emitted as
+                    # `--parsers !,f,i,l,e,s,t,a,t`, which plaso rejects
+                    # and silently processes zero events. Caught on
+                    # case-1005 (2026-05-12): 8 missing Plaso timelines.
+                    "value": ["!filestat"],
                 }
             ],
             "type": "task",
