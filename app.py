@@ -1473,33 +1473,67 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{plaso_uuid}",
             "tasks": [
-                # Plaso super-timeline is JSONL -> stamp_jsonl -> ts.
-                # Without this, every Plaso event in TS has host.id=null
-                # because Plaso doesn't carry hostname-aware fields the
-                # way EVTX-based analysers (chainsaw) do.
-                _stamp_jsonl_then_ts(
-                    sketch_name,
-                    sketch_id,
-                    f"{timeline_name} - Plaso",
-                ),
-                # Phase B of the high-value-artefacts ticket: surface
-                # each high-value parser-class as its own TS timeline
-                # alongside the super-timeline above. Each split task
-                # filters Plaso's JSONL down to one parser; the result
-                # flows through stamp_jsonl -> ts.upload like every
-                # other branch, so split timelines carry the same ECS
-                # host.* set.
-                #
-                # Adding a parser here adds a new timeline. Keep the
-                # list in sync with PLASO_SPLIT_TIMELINES in
-                # openrelik-worker-host-fingerprint's host_id_helpers.
-                *[
-                    _plaso_split_then_stamp_then_ts(
-                        sketch_name, sketch_id, timeline_name,
-                        parser=parser, parser_label=parser_label,
-                    )
-                    for parser, parser_label in _PLASO_SPLIT_PARSERS
-                ],
+                # log2timeline outputs a binary .plaso storage file;
+                # downstream stamp_jsonl / split_jsonl_by_parser tasks
+                # only consume JSONL. psort with output_format=json_line
+                # is the conversion step that turns the .plaso into a
+                # TS-shaped JSONL stream that the rest of the chain can
+                # work with. Without this task, every stamp_jsonl in
+                # the Plaso branch sees zero JSONL files and emits
+                # zero output -- super-timeline + all 7 split
+                # timelines land empty in TimeSketch. Caught on
+                # case-1006 (2026-05-12): 811 MB .plaso produced,
+                # 8 stamp_jsonl tasks all reported
+                # `jsonl_files_seen: 0, events_stamped: 0`.
+                {
+                    "task_name": "openrelik-worker-plaso.tasks.psort",
+                    "queue_name": "openrelik-worker-plaso",
+                    "display_name": "Plaso: Psort (JSONL)",
+                    "description": "Convert .plaso storage to JSONL for downstream stamping + per-parser splits.",
+                    "task_config": [
+                        {
+                            "name": "output_format",
+                            "type": "select",
+                            "required": False,
+                            "value": "json_line",
+                        }
+                    ],
+                    "type": "task",
+                    "uuid": str(uuid.uuid4()).replace("-", ""),
+                    "tasks": [
+                        # Plaso super-timeline: JSONL -> stamp_jsonl -> ts.
+                        # Stamper propagates the ECS host.* set from
+                        # derive_id's sidecar onto every event so the
+                        # super-timeline is queryable by host.id like
+                        # every other triage branch.
+                        _stamp_jsonl_then_ts(
+                            sketch_name,
+                            sketch_id,
+                            f"{timeline_name} - Plaso",
+                        ),
+                        # Phase B of the high-value-artefacts ticket:
+                        # surface each high-value parser-class as its
+                        # own TS timeline alongside the super-timeline.
+                        # Each split task filters psort's JSONL down to
+                        # one parser; the result flows through
+                        # stamp_jsonl -> ts.upload like every other
+                        # branch, so split timelines carry the same ECS
+                        # host.* set.
+                        #
+                        # Adding a parser here adds a new timeline.
+                        # Keep the list in sync with
+                        # PLASO_SPLIT_TIMELINES in
+                        # openrelik-worker-host-fingerprint's
+                        # host_id_helpers.
+                        *[
+                            _plaso_split_then_stamp_then_ts(
+                                sketch_name, sketch_id, timeline_name,
+                                parser=parser, parser_label=parser_label,
+                            )
+                            for parser, parser_label in _PLASO_SPLIT_PARSERS
+                        ],
+                    ],
+                }
             ],
         },
         # Host-fingerprint sibling (PR 3 of the rollout). Runs in
