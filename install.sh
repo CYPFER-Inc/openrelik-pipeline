@@ -1534,13 +1534,40 @@ if [ ! -f server.config.yaml ]; then
   wget -O /opt/velociraptor "\$LINUX_BIN"
   chmod +x /opt/velociraptor
 
+  # Consolidate VR's per-OS scratch / state / upload-spool under a single
+  # parent dir on each OS. Plan: docs/vr-av-exclusions.md (openrelik-vr-config).
+  # This gives the customer's AV/EDR a single recursive exclusion path that
+  # covers tempdir AND writeback AND local_buffer in one rule, instead of
+  # the default-scattered three (/tmp, /etc, /var/tmp on Linux; %TEMP%,
+  # \$ProgramFiles\\Velociraptor, %TEMP% on Windows).
+  #
+  #   Linux:    /var/lib/velociraptor/   (parent; tmp/ + Velociraptor_Buffer.bin + velociraptor.writeback.yaml)
+  #   macOS:    /var/db/velociraptor/    (parent; same children)
+  #   Windows:  \$ProgramFiles\\Velociraptor\\  (parent; Tools/ + Velociraptor_Buffer.bin + velociraptor.writeback.yaml)
+  #
+  # Windows writeback_windows + tempdir_windows are already at the right
+  # location by VR's config-generate default; we only override the buffer
+  # filename on Windows (default was \$TEMP/Velociraptor_Buffer.bin).
   ./velociraptor config generate > server.config.yaml --merge '{
     "Frontend": {"hostname": "${VR_HOSTNAME}", "bind_address": "0.0.0.0", "bind_port": ${VR_CLIENT_PORT}},
     "API": {"bind_address": "0.0.0.0"},
     "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"${VR_GUI_EXTRA}},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
-    "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
+    "Client": {
+      "server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true,
+      "writeback_linux":  "/var/lib/velociraptor/velociraptor.writeback.yaml",
+      "writeback_darwin": "/var/db/velociraptor/velociraptor.writeback.yaml",
+      "tempdir_linux":    "/var/lib/velociraptor/tmp",
+      "tempdir_darwin":   "/var/db/velociraptor/tmp",
+      "local_buffer": {
+        "memory_size": 52428800,
+        "disk_size":   1073741824,
+        "filename_linux":   "/var/lib/velociraptor/Velociraptor_Buffer.bin",
+        "filename_darwin":  "/var/db/velociraptor/Velociraptor_Buffer.bin",
+        "filename_windows": "\$ProgramFiles\\\\Velociraptor\\\\Velociraptor_Buffer.bin"
+      }
+    },
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
 
