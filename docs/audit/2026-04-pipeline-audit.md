@@ -70,8 +70,12 @@ or cosmetic.
   attention to compose surgery, sed substitution, DB patching, and the
   per-service bring-up phases.
 - `scripts/`:
-  - `audit/__init__.py`, `audit/cypfer_ai_audit.py`, `audit/test_cypfer_ai_audit.py`
-    (the only test file across all four repos in this audit family).
+  - `audit/` — previously the canonical `cypfer_ai_audit` library (with the only
+    test file across all four repos in this audit family). **Consolidated out on
+    2026-05-14** into [`CYPFER-Inc/cypfer-ai-audit`](https://github.com/CYPFER-Inc/cypfer-ai-audit);
+    workers now consume it as a pinned git dependency. The audit findings around
+    this directory in the 2026-04 pass were positive (good test coverage, schema
+    locked, full audit envelope) and survive the move.
   - `roster/or-apply.sh` (255 lines), `roster/ts-apply.sh` (200 lines),
     `roster/vr-apply.sh` (125 lines) — RBAC reconcilers, load-bearing for
     chain-of-custody.

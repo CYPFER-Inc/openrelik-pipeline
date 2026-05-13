@@ -272,9 +272,9 @@ scrape_configs:
           action: event
           verdict: verdict_static
 
-  # AI summary worker audit events (Phase 2/5). The vendored cypfer_ai_audit
-  # library (src/audit.py in openrelik-worker-llm-summary) emits one
-  # AUDIT-prefixed JSON line per ai_prompt and ai_response event. Shape:
+  # AI summary worker audit events (Phase 2/5). The `cypfer_ai_audit`
+  # library (package: CYPFER-Inc/cypfer-ai-audit) emits one AUDIT-prefixed
+  # JSON line per ai_prompt and ai_response event. Shape:
   #
   #   AUDIT {"ts":"…","event":"ai_prompt","actor":"ai-summary-worker",
   #          "caseid":"2079","verdict":"ok","model":"…","template":"summary.v1",
