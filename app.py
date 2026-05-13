@@ -14,6 +14,8 @@ from openrelik_api_client.api_client import APIClient
 from openrelik_api_client.folders import FoldersAPI
 from openrelik_api_client.workflows import WorkflowsAPI
 
+from safe_upload import safe_upload_path as _safe_upload_path
+
 # --------------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------------
@@ -1169,6 +1171,112 @@ def _ts_leaf(sketch_name, sketch_id, timeline_name):
     }
 
 
+def _stamp_then_ts(stamp_task_name, sketch_name, sketch_id, timeline_name):
+    """Return a stamp_X -> ts.upload sub-tree.
+
+    Inserts the host-fingerprint stamper between an analyser branch and
+    the Timesketch upload, so every event in the resulting timeline
+    carries the full ECS host.* set (host.id + host.fqdn + host.name +
+    host.machine_guid + host.vr_client_id + host.mac, where populated)
+    propagated from the sidecar emitted by the derive_id sibling task.
+
+    The stamper finds the sidecar at runtime via the OR file API
+    (data_type=openrelik:host-fingerprint:sidecar). If no sidecar is
+    available -- e.g. derive_id failed, or this workflow isn't a
+    triage-from-VR shape -- the stamper passes the analyser output
+    through verbatim and the ts.upload step still runs.
+
+    Used by the Hayabusa (CSV) and Plaso / Chainsaw (JSONL) branches.
+    """
+    return {
+        "task_name": stamp_task_name,
+        "queue_name": "openrelik-worker-host-fingerprint",
+        "display_name": (
+            "Host Fingerprint: stamp host.* on CSV"
+            if "stamp_csv" in stamp_task_name
+            else "Host Fingerprint: stamp host.* on JSONL"
+        ),
+        "description": (
+            "Append ECS host.* columns / fields from the derive_id sidecar "
+            "to every event before Timesketch upload."
+        ),
+        "task_config": [],
+        "type": "task",
+        "uuid": str(uuid.uuid4()).replace("-", ""),
+        "tasks": [
+            _ts_leaf(sketch_name, sketch_id, timeline_name),
+        ],
+    }
+
+
+def _stamp_csv_then_ts(sketch_name, sketch_id, timeline_name):
+    return _stamp_then_ts(
+        "openrelik-worker-host-fingerprint.tasks.stamp_csv",
+        sketch_name, sketch_id, timeline_name,
+    )
+
+
+def _stamp_jsonl_then_ts(sketch_name, sketch_id, timeline_name):
+    return _stamp_then_ts(
+        "openrelik-worker-host-fingerprint.tasks.stamp_jsonl",
+        sketch_name, sketch_id, timeline_name,
+    )
+
+
+# Phase B of the high-value-artefacts ticket: surface each of these
+# Plaso parsers as its own TS timeline instead of leaving them buried
+# in the super-timeline. Order: (plaso_parser, analyst-facing label).
+#
+# Adding an entry here adds a new sibling branch under Plaso. The
+# split task filters Plaso's super-timeline JSONL down to one
+# parser, then the shared stamp_jsonl -> ts.upload chain stamps the
+# ECS host.* set and uploads as a named timeline. Mirror in
+# openrelik-worker-host-fingerprint's PLASO_SPLIT_TIMELINES dict so
+# the two stay in sync (worker only cares about the parser-name key;
+# pipeline owns the timeline label here).
+_PLASO_SPLIT_PARSERS = [
+    ("amcache",            "AmCache (Program Execution)"),
+    ("appcompatcache",     "ShimCache"),
+    ("bam",                "BAM / DAM (Background Activity)"),
+    ("winjob",             "Scheduled Tasks"),
+    ("powershell_console", "PowerShell History"),
+    ("activities_cache",   "Windows Timeline (Activities Cache)"),
+    ("userassist",         "UserAssist / Recent Apps"),
+]
+
+
+def _plaso_split_then_stamp_then_ts(
+    sketch_name, sketch_id, timeline_name_base, parser, parser_label,
+):
+    """Return a split_jsonl_by_parser -> stamp_jsonl -> ts.upload
+    sub-tree for one Phase B parser. Used as a sibling of Plaso's
+    direct ts.upload branch so the super-timeline still lands AND the
+    split timeline lands."""
+    timeline_name = f"{timeline_name_base} - {parser_label}"
+    return {
+        "task_name": "openrelik-worker-host-fingerprint.tasks.split_jsonl_by_parser",
+        "queue_name": "openrelik-worker-host-fingerprint",
+        "display_name": f"Plaso split: {parser_label}",
+        "description": (
+            f"Filter Plaso super-timeline JSONL to events from parser "
+            f"`{parser}` for the {parser_label} TimeSketch timeline."
+        ),
+        "task_config": [
+            {
+                "name": "parser",
+                "type": "string",
+                "required": True,
+                "value": parser,
+            }
+        ],
+        "type": "task",
+        "uuid": str(uuid.uuid4()).replace("-", ""),
+        "tasks": [
+            _stamp_jsonl_then_ts(sketch_name, sketch_id, timeline_name),
+        ],
+    }
+
+
 def add_triage_ts_tasks_to_workflow(
     folder_id,
     workflow_id,
@@ -1177,6 +1285,7 @@ def add_triage_ts_tasks_to_workflow(
     timeline_name,
     chainsaw_min_level="high",
     is_archive=True,
+    source_archive_name=None,
 ):
     """
     Catchall triage workflow: optional extract -> fan out to every known
@@ -1187,19 +1296,22 @@ def add_triage_ts_tasks_to_workflow(
         is_archive=True (.zip / .tar.gz / .7z / ...):
             extract_archive
               ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
-              ├── hayabusa csv_timeline          -> ts (timeline: "<base> - Hayabusa")
-              ├── chainsaw hunt_evtx             -> ts (timeline: "<base> - Chainsaw Sigma")
-              ├── chainsaw builtin_only          -> ts (timeline: "<base> - Chainsaw Built-in")
-              ├── chainsaw analyse_srum          -> ts (timeline: "<base> - Chainsaw SRUM")
-              └── plaso log2timeline             -> ts (timeline: "<base> - Plaso")
+              ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
+              ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
+              ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
+              ├── chainsaw analyse_srum   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw SRUM")
+              └── plaso log2timeline
+                    ├── stamp_jsonl -> ts ("<base> - Plaso" -- the super-timeline)
+                    ├── split[amcache]            -> stamp_jsonl -> ts ("<base> - AmCache ...")
+                    ├── split[appcompatcache]     -> stamp_jsonl -> ts ("<base> - ShimCache")
+                    ├── split[bam]                -> stamp_jsonl -> ts ("<base> - BAM / DAM ...")
+                    ├── split[winjob]             -> stamp_jsonl -> ts ("<base> - Scheduled Tasks")
+                    ├── split[powershell_console] -> stamp_jsonl -> ts ("<base> - PowerShell History")
+                    ├── split[activities_cache]   -> stamp_jsonl -> ts ("<base> - Windows Timeline ...")
+                    └── split[userassist]         -> stamp_jsonl -> ts ("<base> - UserAssist ...")
 
         is_archive=False (.evtx / .log / .pf / loose registry hive / ...):
-            ├── derive_id (host-fingerprint)
-            ├── hayabusa csv_timeline    -> ts
-            ├── chainsaw hunt_evtx       -> ts
-            ├── chainsaw builtin_only    -> ts
-            ├── chainsaw analyse_srum    -> ts
-            └── plaso log2timeline       -> ts
+            Same shape, no extract_archive parent.
 
     The plain-input branch skips extract_archive because the extraction
     worker invokes 7zip then tar and raises on non-archive input
@@ -1214,16 +1326,22 @@ def add_triage_ts_tasks_to_workflow(
     consistent with how the network endpoint behaves and never
     hard-errors.
 
-    Host-fingerprint integration (PR 3 of the rollout):
+    Host-fingerprint integration (PR 3 + PR 4 of the rollout):
     `derive_id` is added as a SIBLING branch (parallel to the
     analysers, not a parent), so it runs alongside without gating
     fan-out. It produces a sidecar JSON tagged
     `data_type=openrelik:host-fingerprint:sidecar` that's visible in
-    the OR UI and queryable by analysts. Stamper integration
-    (`stamp_csv` between hayabusa and ts.upload, `stamp_jsonl` between
-    plaso and ts.upload) is PR 4 of the rollout once the sidecar
-    consumption pattern is settled. Until PR 4, only chainsaw events
-    carry `host.id` (chainsaw self-derives via PR #8 of its own repo).
+    the OR UI and queryable by analysts.
+
+    `stamp_csv` (between hayabusa and ts.upload) and `stamp_jsonl`
+    (between plaso / chainsaw branches and ts.upload) propagate the
+    full ECS host.* set onto every event:
+        host.id, host.fqdn, host.name, host.machine_guid,
+        host.vr_client_id, host.mac (where populated).
+    Sidecar is canonical -- if any analyser already wrote one of those
+    fields (e.g. chainsaw self-derives host.id via PR #8 of its repo),
+    the stamper overwrites it for single-source-of-truth across all
+    triage branches.
     """
     hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
@@ -1242,7 +1360,10 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{hayabusa_uuid}",
             "tasks": [
-                _ts_leaf(
+                # Hayabusa output is CSV -> stamp_csv -> ts.upload.
+                # Stamper appends ECS host.* columns to every row from
+                # the derive_id sidecar before TS ingestion.
+                _stamp_csv_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Hayabusa",
@@ -1267,7 +1388,11 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{chainsaw_hunt_uuid}",
             "tasks": [
-                _ts_leaf(
+                # Chainsaw outputs JSONL via timesketch_mapper. Stamper
+                # overwrites chainsaw's self-derived host.id (PR #8 of
+                # chainsaw worker) with the sidecar value -- single
+                # source of truth across all triage branches.
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw Sigma",
@@ -1283,7 +1408,7 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{chainsaw_builtin_uuid}",
             "tasks": [
-                _ts_leaf(
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw Built-in",
@@ -1299,7 +1424,7 @@ def add_triage_ts_tasks_to_workflow(
             "type": "task",
             "uuid": f"{chainsaw_srum_uuid}",
             "tasks": [
-                _ts_leaf(
+                _stamp_jsonl_then_ts(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw SRUM",
@@ -1333,20 +1458,82 @@ def add_triage_ts_tasks_to_workflow(
                 {
                     "name": "parsers",
                     "label": "Plaso parsers",
-                    "description": "Comma-separated parser list with optional `!` negation. Defaults to all parsers minus filestat.",
+                    "description": "List of parser names with optional `!` negation. Defaults to all parsers minus filestat.",
                     "type": "text",
                     "required": False,
-                    "value": "!filestat",
+                    # Must be a list, not a string: openrelik-worker-plaso
+                    # does `",".join(task_config["parsers"])` -- a bare
+                    # string is iterated char-by-char and emitted as
+                    # `--parsers !,f,i,l,e,s,t,a,t`, which plaso rejects
+                    # and silently processes zero events. Caught on
+                    # case-1005 (2026-05-12): 8 missing Plaso timelines.
+                    "value": ["!filestat"],
                 }
             ],
             "type": "task",
             "uuid": f"{plaso_uuid}",
             "tasks": [
-                _ts_leaf(
-                    sketch_name,
-                    sketch_id,
-                    f"{timeline_name} - Plaso",
-                )
+                # log2timeline outputs a binary .plaso storage file;
+                # downstream stamp_jsonl / split_jsonl_by_parser tasks
+                # only consume JSONL. psort with output_format=json_line
+                # is the conversion step that turns the .plaso into a
+                # TS-shaped JSONL stream that the rest of the chain can
+                # work with. Without this task, every stamp_jsonl in
+                # the Plaso branch sees zero JSONL files and emits
+                # zero output -- super-timeline + all 7 split
+                # timelines land empty in TimeSketch. Caught on
+                # case-1006 (2026-05-12): 811 MB .plaso produced,
+                # 8 stamp_jsonl tasks all reported
+                # `jsonl_files_seen: 0, events_stamped: 0`.
+                {
+                    "task_name": "openrelik-worker-plaso.tasks.psort",
+                    "queue_name": "openrelik-worker-plaso",
+                    "display_name": "Plaso: Psort (JSONL)",
+                    "description": "Convert .plaso storage to JSONL for downstream stamping + per-parser splits.",
+                    "task_config": [
+                        {
+                            "name": "output_format",
+                            "type": "select",
+                            "required": False,
+                            "value": "json_line",
+                        }
+                    ],
+                    "type": "task",
+                    "uuid": str(uuid.uuid4()).replace("-", ""),
+                    "tasks": [
+                        # Plaso super-timeline: JSONL -> stamp_jsonl -> ts.
+                        # Stamper propagates the ECS host.* set from
+                        # derive_id's sidecar onto every event so the
+                        # super-timeline is queryable by host.id like
+                        # every other triage branch.
+                        _stamp_jsonl_then_ts(
+                            sketch_name,
+                            sketch_id,
+                            f"{timeline_name} - Plaso",
+                        ),
+                        # Phase B of the high-value-artefacts ticket:
+                        # surface each high-value parser-class as its
+                        # own TS timeline alongside the super-timeline.
+                        # Each split task filters psort's JSONL down to
+                        # one parser; the result flows through
+                        # stamp_jsonl -> ts.upload like every other
+                        # branch, so split timelines carry the same ECS
+                        # host.* set.
+                        #
+                        # Adding a parser here adds a new timeline.
+                        # Keep the list in sync with
+                        # PLASO_SPLIT_TIMELINES in
+                        # openrelik-worker-host-fingerprint's
+                        # host_id_helpers.
+                        *[
+                            _plaso_split_then_stamp_then_ts(
+                                sketch_name, sketch_id, timeline_name,
+                                parser=parser, parser_label=parser_label,
+                            )
+                            for parser, parser_label in _PLASO_SPLIT_PARSERS
+                        ],
+                    ],
+                }
             ],
         },
         # Host-fingerprint sibling (PR 3 of the rollout). Runs in
@@ -1355,12 +1542,32 @@ def add_triage_ts_tasks_to_workflow(
         # to upstream worker output. No `tasks: [...]` -- this branch
         # has no children today; sidecar is its only artefact and
         # lands in the workflow folder.
+        #
+        # source_archive_name passes the original upload filename
+        # through to derive_id's Tier-4 filename heuristic. Without it,
+        # the worker only sees OR-renamed UUID basenames and Tier-4
+        # never fires -- caught during case-2133 sidecar inspection
+        # where every host.* field came back null. The worker's
+        # Tier-4-VR regex parses HOST_<fqdn>_<8hex>_<label>.zip into
+        # host.fqdn / host.vr_client_id; the legacy regex handles
+        # vr_kapefiles_<fqdn>_<label>.zip for pre-cutover collections.
         {
             "task_name": "openrelik-worker-host-fingerprint.tasks.derive_id",
             "queue_name": "openrelik-worker-host-fingerprint",
             "display_name": "Host Fingerprint: derive host.id",
             "description": "Derive a per-collection host.id (MachineGuid + filename heuristics) from extracted forensic input; emit sidecar JSON for cross-pipeline correlation.",
-            "task_config": [],
+            "task_config": (
+                [
+                    {
+                        "name": "source_archive_name",
+                        "type": "string",
+                        "required": False,
+                        "value": source_archive_name,
+                    }
+                ]
+                if source_archive_name
+                else []
+            ),
             "type": "task",
             "uuid": f"{host_fingerprint_uuid}",
             "tasks": [],
@@ -1641,8 +1848,7 @@ def api_hayabusa_timesketch():
     file = request.files["file"]
     filename = file.filename
     timeline_name, extension = os.path.splitext(filename)
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
     fqdn, label = extract_fqdn_and_label(filename)
 
     # Always send to sketch 1 (created by ts-config on install)
@@ -1686,8 +1892,7 @@ def api_hayabusa():
     file = request.files["file"]
     filename = file.filename
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     folder_id = create_folder(f"{filename} Hayabusa Timelines")
     file_id = upload_file(file_path, folder_id)
@@ -1768,8 +1973,7 @@ def api_triage_timesketch():
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     if case_id:
         folder_id = find_or_create_case_folder(case_id)
@@ -1791,6 +1995,12 @@ def api_triage_timesketch():
     add_triage_ts_tasks_to_workflow(
         folder_id, workflow_id, sketch_name, sketch_id, timeline_name,
         is_archive=is_archive,
+        # Pass the original upload filename through to derive_id so its
+        # Tier-4 filename heuristic can extract FQDN + VR client_id from
+        # the HOST_<fqdn>_<8hex>_<label>.zip pattern. Without this,
+        # derive_id only sees OR-renamed UUID basenames and Tier-4
+        # never fires.
+        source_archive_name=filename,
     )
     run = run_workflow(folder_id, workflow_id)
 
@@ -1877,8 +2087,7 @@ def api_network_timesketch():
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     if case_id:
         folder_id = find_or_create_case_folder(case_id)
@@ -1931,8 +2140,7 @@ def api_plaso_timesketch():
     timeline_name = fqdn if fqdn else timeline_name
     sketch_name = ""  # not used when sketch_id is set
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     folder_id = create_folder(f"{filename} Plaso Timeline")
     file_id = upload_file(file_path, folder_id)
@@ -1969,8 +2177,7 @@ def api_plaso():
     file = request.files["file"]
     filename = file.filename
 
-    file_path = os.path.join("/tmp", filename)
-    file.save(file_path)
+    file_path = _safe_upload_path(file)
 
     folder_id = create_folder(f"{filename} Plaso Timeline")
     file_id = upload_file(file_path, folder_id)

@@ -1495,6 +1495,15 @@ if [ "${INSTALL_VR}" = "true" ]; then
       - VELOCIRAPTOR_PASSWORD=${VELOCIRAPTOR_PASSWORD}
       - IP_ADDRESS=${IP_ADDRESS}
       - VR_BOOTSTRAP_USERS=${VR_BOOTSTRAP_USERS:-}
+      # CASE_ID is read by VR server-event artefacts via getenv("CASE_ID"):
+      #   - Custom.Refinery.ClientAutoLabel applies Case-<CASE_ID> to
+      #     newly-registered clients
+      #   - Custom.Refinery.PC.L2.Server.OpenRelik's _safe_label uses
+      #     Case-<CASE_ID> as the filename fallback when a client somehow
+      #     has no label
+      # Together these eliminate the unlabelled-Null fallback filenames
+      # that were landing in OR before this env var was passed through.
+      - CASE_ID=${CASE_ID:-}
     ports:
       - "${VR_CLIENT_PORT}:${VR_CLIENT_PORT}"
       - "8001:8001"
