@@ -74,6 +74,28 @@ vr_user_add() {
         --config /opt/server.config.yaml user add "$email" --role "$vr_role" \
         >/dev/null 2>&1 \
         || die "velociraptor user add failed: $email"
+
+    # CYPFER policy 2026-05-12: investigators must be able to run code on
+    # endpoints (Windows.System.CmdShell + any artifact that does execve()).
+    # VR's built-in `investigator` role intentionally omits EXECVE for
+    # least-privilege defaults, so we explicitly add it via the ACL policy.
+    # Without this, eazbel-style "CreateHunt: GetOrgConfig PermissionDenied:
+    # While collecting artifact (Windows.System.CmdShell) permission denied
+    # EXECVE" errors hit every analyst on first attempt.
+    # administrators already get EXECVE via the role; readers are
+    # intentionally left without it.
+    #
+    # `acl grant` writes a JSON policy and REPLACES (not merges) the user's
+    # policy, so we have to include the role too. VR picks up the change on
+    # next restart -- the apply path already restarts at the end (RESTART=1
+    # by default) so this is in lockstep with the existing user-add flow.
+    if [ "$vr_role" = "investigator" ]; then
+        docker exec velociraptor /opt/velociraptor \
+            --config /opt/server.config.yaml acl grant "$email" \
+            '{"roles":["investigator"],"execve":true}' \
+            >/dev/null 2>&1 \
+            || log "WARNING: acl grant EXECVE failed for $email -- user can still log in, but hunts requiring execve will be denied"
+    fi
 }
 
 # ---------------------------------------------------------------------------
