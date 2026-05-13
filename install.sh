@@ -746,6 +746,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
       "ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-host-fingerprint:${OPENRELIK_WORKER_HOST_FINGERPRINT_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-rdp-cache:${OPENRELIK_WORKER_RDP_CACHE_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
       MIRRORED=$(mirror_image "${img}")
       echo "  Pulling ${MIRRORED}..."
@@ -1356,6 +1357,21 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-host-fingerprint failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-host-fingerprint"
+  fi
+
+  # Start the RDP cache worker (Phase C #1 -- bmc-tools wrapper).
+  # Compose block injected by or-config's configure.py from
+  # workers/openrelik-worker-rdp-cache.yml. Worker runs as a sibling
+  # of the other triage analysers; emits per-tile + collage BMP
+  # artefacts to the workflow folder when bcache*.bmc / Cache????.bin
+  # files are present in the extracted input.
+  docker compose up -d openrelik-worker-rdp-cache 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-rdp-cache"; then
+    echo "openrelik-worker-rdp-cache is running"
+  else
+    echo "WARNING: openrelik-worker-rdp-cache failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-rdp-cache"
   fi
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
