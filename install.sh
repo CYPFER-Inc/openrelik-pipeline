@@ -1534,13 +1534,25 @@ if [ ! -f server.config.yaml ]; then
   wget -O /opt/velociraptor "\$LINUX_BIN"
   chmod +x /opt/velociraptor
 
+  # Per-OS client temp directories.
+  #   - Windows: VR config generate's default already sets
+  #       tempdir_windows: \$ProgramFiles\Velociraptor\Tools
+  #     so we don't override it here.
+  #   - Linux:   override the default (/tmp -- shared, world-writable) to
+  #     a VR-owned locked-down path. AV/EDR exclusion for
+  #     /var/lib/velociraptor/tmp/* then covers the random-named tmpfiles
+  #     that VR's child processes (Hayabusa, Chainsaw, 7z, plaso) create
+  #     during collection without having to allow all of /tmp.
+  #   - macOS:   same idea under /var/db/velociraptor/tmp.
+  # The directories themselves are created by the VR client postinstall
+  # (DEB/RPM scripts in openrelik-vr-config). See docs/vr-av-exclusions.md.
   ./velociraptor config generate > server.config.yaml --merge '{
     "Frontend": {"hostname": "${VR_HOSTNAME}", "bind_address": "0.0.0.0", "bind_port": ${VR_CLIENT_PORT}},
     "API": {"bind_address": "0.0.0.0"},
     "GUI": {"public_url": "${VELOCIRAPTOR_PUBLIC_URL:-https://$IP_ADDRESS:8889}/app/index.html", "bind_address": "0.0.0.0"${VR_GUI_EXTRA}},
     "Monitoring": {"bind_address": "0.0.0.0"},
     "Logging": {"output_directory": "/opt/vr_data/logs", "separate_logs_per_component": true},
-    "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true},
+    "Client": {"server_urls": ["${VR_CLIENT_URL}"], "use_self_signed_ssl": true, "tempdir_linux": "/var/lib/velociraptor/tmp", "tempdir_darwin": "/var/db/velociraptor/tmp"},
     "Datastore": {"location": "/opt/vr_data", "filestore_directory": "/opt/vr_data"}
   }'
 
