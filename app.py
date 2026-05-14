@@ -1296,6 +1296,7 @@ def add_triage_ts_tasks_to_workflow(
         is_archive=True (.zip / .tar.gz / .7z / ...):
             extract_archive
               ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
+              ├── parse_cache (rdp-cache)        -> tile / collage / manifest artefacts
               ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
@@ -1342,6 +1343,12 @@ def add_triage_ts_tasks_to_workflow(
     fields (e.g. chainsaw self-derives host.id via PR #8 of its repo),
     the stamper overwrites it for single-source-of-truth across all
     triage branches.
+
+    RDP cache (Phase C #1) is also a SIBLING branch with no children:
+    parse_cache picks up `bcache*.bmc` / `Cache????.bin` files from the
+    extracted set and emits per-tile + collage BMP artefacts plus a
+    manifest JSON, all visible in the workflow folder. Not TS-bound --
+    the tiles have no event timestamps.
     """
     hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
@@ -1349,6 +1356,7 @@ def add_triage_ts_tasks_to_workflow(
     chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
     plaso_uuid = str(uuid.uuid4()).replace("-", "")
     host_fingerprint_uuid = str(uuid.uuid4()).replace("-", "")
+    rdp_cache_uuid = str(uuid.uuid4()).replace("-", "")
 
     analyser_branches = [
         {
@@ -1570,6 +1578,28 @@ def add_triage_ts_tasks_to_workflow(
             ),
             "type": "task",
             "uuid": f"{host_fingerprint_uuid}",
+            "tasks": [],
+        },
+        # RDP bitmap cache sibling (Phase C #1 of the high-value-
+        # artefacts ticket). Picks up `bcache*.bmc` / `Cache????.bin`
+        # files from the extracted set and reconstructs the cached
+        # tiles via ANSSI bmc-tools. Output is per-tile + collage
+        # BMP artefacts plus a manifest JSON, all surfaced in the
+        # workflow folder for analyst download. No TS upload --
+        # tiles are pixel data with no event timestamps.
+        #
+        # Worker filters on filename pattern internally; if the
+        # input set has no cache files (most cases won't), the
+        # task no-ops cleanly and emits a manifest noting zero
+        # matches. Same fan-out tolerance as the other analysers.
+        {
+            "task_name": "openrelik-worker-rdp-cache.tasks.parse_cache",
+            "queue_name": "openrelik-worker-rdp-cache",
+            "display_name": "RDP Bitmap Cache: extract tiles",
+            "description": "Reconstruct RDP session screen tiles from Windows mstsc bcache*.bmc / Cache????.bin via ANSSI bmc-tools. Output: per-tile + collage BMPs + manifest JSON. Not TS-bound.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{rdp_cache_uuid}",
             "tasks": [],
         },
     ]
