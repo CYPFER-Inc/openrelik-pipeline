@@ -778,6 +778,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
       "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-host-fingerprint:${OPENRELIK_WORKER_HOST_FINGERPRINT_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-rdp-cache:${OPENRELIK_WORKER_RDP_CACHE_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-onedrive:${OPENRELIK_WORKER_ONEDRIVE_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
       MIRRORED=$(mirror_image "${img}")
       echo "  Pulling ${MIRRORED}..."
@@ -1419,6 +1420,21 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-rdp-cache failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-rdp-cache"
+  fi
+
+  # Start the OneDrive worker (Phase C #2 -- Beercow OneDriveExplorer
+  # wrapper). Same pattern: compose block injected by or-config's
+  # configure.py from workers/openrelik-worker-onedrive.yml. Worker
+  # runs as a sibling of the other triage analysers; emits per-tenant
+  # report JSON + manifest artefacts when OneDrive client files are
+  # present in the extracted input.
+  docker compose up -d openrelik-worker-onedrive 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-onedrive"; then
+    echo "openrelik-worker-onedrive is running"
+  else
+    echo "WARNING: openrelik-worker-onedrive failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-onedrive"
   fi
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
