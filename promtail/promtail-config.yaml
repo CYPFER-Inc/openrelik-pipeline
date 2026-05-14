@@ -272,6 +272,71 @@ scrape_configs:
           action: event
           verdict: verdict_static
 
+  # AI tagger worker audit events (v2 Phase 4). The `cypfer_ai_audit`
+  # library (v0.2.0+) emits four AUDIT-prefixed event types from this
+  # worker:
+  #
+  #   ai_prompt       — before the LLM batch call (verdict=ok)
+  #   ai_response     — after the LLM batch (verdict ok|refused|error)
+  #   ai_tag_applied  — per (event_id, tag) tag write (verdict ok|error)
+  #   ai_tag_skipped  — per (event_id, tag) deliberate skip
+  #                     (reason ∈ {unknown_tag, low_confidence, already_tagged};
+  #                      verdict=skipped)
+  #
+  # Schema is canonical in microcloud:llm/README.md §7. Hashes (not
+  # full content) keep audit volume bounded — full prompt + response
+  # are stored as OR workflow artifacts and discoverable by sha256.
+  #
+  # `event` / `reason` / `verdict` / `actor` are promoted to Loki
+  # labels so Grafana panels and Slack alerts can group cheaply
+  # (high-volume unknown_tag rate, refusal rate per case, TS write
+  # error rate, etc.). `event_id`, `tag`, and `confidence` stay in
+  # the body — they're high-cardinality and don't belong as labels.
+  - job_name: openrelik-worker-llm-tagger-audit
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 15s
+        filters:
+          - name: name
+            values: [openrelik-worker-llm-tagger]
+    relabel_configs:
+      - target_label: 'job'
+        replacement: 'openrelik-worker-llm-tagger-audit'
+      - target_label: 'case'
+        replacement: '__CASE_ID__'
+      - target_label: 'host'
+        replacement: 'case-__CASE_ID__'
+      - target_label: 'source'
+        replacement: 'ai-tagger'
+      - target_label: 'class'
+        replacement: 'audit'
+    pipeline_stages:
+      - regex:
+          expression: '^AUDIT (?P<audit_json>\{.*\})\s*$'
+      - template:
+          source: audit_json
+          template: '{{ default "" .audit_json }}'
+      - drop:
+          source: audit_json
+          expression: '^$'
+          drop_counter_reason: non_audit_line
+      - json:
+          source: audit_json
+          expressions:
+            ts: ts
+            event: event
+            actor: actor
+            verdict: verdict
+            reason: reason
+      - timestamp:
+          source: ts
+          format: RFC3339
+      - labels:
+          actor:
+          action: event
+          verdict:
+          reason:
+
   # AI summary worker audit events (Phase 2/5). The `cypfer_ai_audit`
   # library (package: CYPFER-Inc/cypfer-ai-audit) emits one AUDIT-prefixed
   # JSON line per ai_prompt and ai_response event. Shape:
