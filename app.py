@@ -1301,6 +1301,7 @@ def add_triage_ts_tasks_to_workflow(
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
               ├── chainsaw analyse_srum   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw SRUM")
+              ├── bits parse_bits         -> stamp_jsonl -> ts (timeline: "<base> - BITS")
               └── plaso log2timeline
                     ├── stamp_jsonl -> ts ("<base> - Plaso" -- the super-timeline)
                     ├── split[amcache]            -> stamp_jsonl -> ts ("<base> - AmCache ...")
@@ -1354,6 +1355,7 @@ def add_triage_ts_tasks_to_workflow(
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_builtin_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
+    bits_uuid = str(uuid.uuid4()).replace("-", "")
     plaso_uuid = str(uuid.uuid4()).replace("-", "")
     host_fingerprint_uuid = str(uuid.uuid4()).replace("-", "")
     rdp_cache_uuid = str(uuid.uuid4()).replace("-", "")
@@ -1436,6 +1438,34 @@ def add_triage_ts_tasks_to_workflow(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw SRUM",
+                )
+            ],
+        },
+        # BITS queue parser (Phase C #3 of the high-value-artefacts
+        # ticket). Picks up qmgr*.dat / qmgr.db from the extracted
+        # set, parses with ANSSI bits_parser, converts CSV output to
+        # TS-shaped JSONL inline (one event per BITS job, datetime
+        # from CreationTime). Chains downstream into the standard
+        # stamp_jsonl -> ts.upload pipeline, same as the chainsaw
+        # branches.
+        #
+        # Worker filters internally on filename; if the input has no
+        # qmgr files the task no-ops cleanly and the manifest reports
+        # zero matches -- same fan-out tolerance as the other
+        # analysers.
+        {
+            "task_name": "openrelik-worker-bits.tasks.parse_bits",
+            "queue_name": "openrelik-worker-bits",
+            "display_name": "BITS Queue: parse + emit TS JSONL",
+            "description": "Parse Windows BITS qmgr*.dat / qmgr.db queue files via ANSSI bits_parser; emit one TS-shaped JSONL event per BITS job. Chained downstream into stamp_jsonl -> ts.upload.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{bits_uuid}",
+            "tasks": [
+                _stamp_jsonl_then_ts(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - BITS",
                 )
             ],
         },
