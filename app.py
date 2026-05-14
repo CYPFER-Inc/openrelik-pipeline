@@ -1297,6 +1297,7 @@ def add_triage_ts_tasks_to_workflow(
             extract_archive
               ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
               ├── parse_cache (rdp-cache)        -> tile / collage / manifest artefacts
+              ├── parse_onedrive (onedrive)      -> per-tenant report JSON + manifest
               ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
@@ -1359,6 +1360,7 @@ def add_triage_ts_tasks_to_workflow(
     plaso_uuid = str(uuid.uuid4()).replace("-", "")
     host_fingerprint_uuid = str(uuid.uuid4()).replace("-", "")
     rdp_cache_uuid = str(uuid.uuid4()).replace("-", "")
+    onedrive_uuid = str(uuid.uuid4()).replace("-", "")
 
     analyser_branches = [
         {
@@ -1630,6 +1632,31 @@ def add_triage_ts_tasks_to_workflow(
             "task_config": [],
             "type": "task",
             "uuid": f"{rdp_cache_uuid}",
+            "tasks": [],
+        },
+        # OneDrive Explorer sibling (Phase C #2 of the high-value-
+        # artefacts ticket). Picks up OneDrive client artefacts
+        # (<UserCid>.dat, SyncEngine SQLite DBs, ODL logs) from the
+        # extracted set and parses them via Beercow OneDriveExplorer
+        # in --LIVE mode. Output is per-tenant report JSON + a
+        # manifest, surfaced as workflow artefacts. No TS upload in
+        # v1 -- OneDriveExplorer emits nested-folder JSON, not an
+        # event stream. A v2 transformer task will fan reports out
+        # into TS-shaped JSONL events for timeline ingestion.
+        #
+        # Worker filters internally on filename pattern + path hint
+        # ("AppData\\Local\\Microsoft\\OneDrive\\..."), so cases
+        # without OneDrive artefacts no-op cleanly and emit a
+        # manifest reporting zero matches -- same fan-out tolerance
+        # as the other analysers.
+        {
+            "task_name": "openrelik-worker-onedrive.tasks.parse_onedrive",
+            "queue_name": "openrelik-worker-onedrive",
+            "display_name": "OneDrive Explorer: parse OneDrive artefacts",
+            "description": "Parse OneDrive client artefacts (<UserCid>.dat, SyncEngine SQLite, ODL logs) via Beercow OneDriveExplorer in --LIVE mode. Output: per-tenant report JSON + manifest. Not TS-bound (v1).",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{onedrive_uuid}",
             "tasks": [],
         },
     ]
