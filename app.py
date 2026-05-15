@@ -1296,10 +1296,16 @@ def add_triage_ts_tasks_to_workflow(
         is_archive=True (.zip / .tar.gz / .7z / ...):
             extract_archive
               ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
+              ├── parse_cache (rdp-cache)        -> tile / collage / manifest artefacts
+              ├── parse_onedrive (onedrive)      -> per-tenant report JSON + manifest
+              ├── find_wmi_persistence (wmi)     -> WMI persistence text report
+              ├── mftecmd ($MFT/$J)              -> CSV with richer USN reason flags (artefact-only)
+              ├── lecmd (PCA / Win11)            -> PCA execution-evidence CSV (artefact-only)
               ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
               ├── chainsaw analyse_srum   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw SRUM")
+              ├── bits parse_bits         -> stamp_jsonl -> ts (timeline: "<base> - BITS")
               └── plaso log2timeline
                     ├── stamp_jsonl -> ts ("<base> - Plaso" -- the super-timeline)
                     ├── split[amcache]            -> stamp_jsonl -> ts ("<base> - AmCache ...")
@@ -1342,13 +1348,25 @@ def add_triage_ts_tasks_to_workflow(
     fields (e.g. chainsaw self-derives host.id via PR #8 of its repo),
     the stamper overwrites it for single-source-of-truth across all
     triage branches.
+
+    RDP cache (Phase C #1) is also a SIBLING branch with no children:
+    parse_cache picks up `bcache*.bmc` / `Cache????.bin` files from the
+    extracted set and emits per-tile + collage BMP artefacts plus a
+    manifest JSON, all visible in the workflow folder. Not TS-bound --
+    the tiles have no event timestamps.
     """
     hayabusa_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_hunt_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_builtin_uuid = str(uuid.uuid4()).replace("-", "")
     chainsaw_srum_uuid = str(uuid.uuid4()).replace("-", "")
+    bits_uuid = str(uuid.uuid4()).replace("-", "")
     plaso_uuid = str(uuid.uuid4()).replace("-", "")
     host_fingerprint_uuid = str(uuid.uuid4()).replace("-", "")
+    rdp_cache_uuid = str(uuid.uuid4()).replace("-", "")
+    onedrive_uuid = str(uuid.uuid4()).replace("-", "")
+    wmi_uuid = str(uuid.uuid4()).replace("-", "")
+    mftecmd_uuid = str(uuid.uuid4()).replace("-", "")
+    pca_uuid = str(uuid.uuid4()).replace("-", "")
 
     analyser_branches = [
         {
@@ -1428,6 +1446,34 @@ def add_triage_ts_tasks_to_workflow(
                     sketch_name,
                     sketch_id,
                     f"{timeline_name} - Chainsaw SRUM",
+                )
+            ],
+        },
+        # BITS queue parser (Phase C #3 of the high-value-artefacts
+        # ticket). Picks up qmgr*.dat / qmgr.db from the extracted
+        # set, parses with ANSSI bits_parser, converts CSV output to
+        # TS-shaped JSONL inline (one event per BITS job, datetime
+        # from CreationTime). Chains downstream into the standard
+        # stamp_jsonl -> ts.upload pipeline, same as the chainsaw
+        # branches.
+        #
+        # Worker filters internally on filename; if the input has no
+        # qmgr files the task no-ops cleanly and the manifest reports
+        # zero matches -- same fan-out tolerance as the other
+        # analysers.
+        {
+            "task_name": "openrelik-worker-bits.tasks.parse_bits",
+            "queue_name": "openrelik-worker-bits",
+            "display_name": "BITS Queue: parse + emit TS JSONL",
+            "description": "Parse Windows BITS qmgr*.dat / qmgr.db queue files via ANSSI bits_parser; emit one TS-shaped JSONL event per BITS job. Chained downstream into stamp_jsonl -> ts.upload.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{bits_uuid}",
+            "tasks": [
+                _stamp_jsonl_then_ts(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - BITS",
                 )
             ],
         },
@@ -1570,6 +1616,123 @@ def add_triage_ts_tasks_to_workflow(
             ),
             "type": "task",
             "uuid": f"{host_fingerprint_uuid}",
+            "tasks": [],
+        },
+        # RDP bitmap cache sibling (Phase C #1 of the high-value-
+        # artefacts ticket). Picks up `bcache*.bmc` / `Cache????.bin`
+        # files from the extracted set and reconstructs the cached
+        # tiles via ANSSI bmc-tools. Output is per-tile + collage
+        # BMP artefacts plus a manifest JSON, all surfaced in the
+        # workflow folder for analyst download. No TS upload --
+        # tiles are pixel data with no event timestamps.
+        #
+        # Worker filters on filename pattern internally; if the
+        # input set has no cache files (most cases won't), the
+        # task no-ops cleanly and emits a manifest noting zero
+        # matches. Same fan-out tolerance as the other analysers.
+        {
+            "task_name": "openrelik-worker-rdp-cache.tasks.parse_cache",
+            "queue_name": "openrelik-worker-rdp-cache",
+            "display_name": "RDP Bitmap Cache: extract tiles",
+            "description": "Reconstruct RDP session screen tiles from Windows mstsc bcache*.bmc / Cache????.bin via ANSSI bmc-tools. Output: per-tile + collage BMPs + manifest JSON. Not TS-bound.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{rdp_cache_uuid}",
+            "tasks": [],
+        },
+        # OneDrive Explorer sibling (Phase C #2 of the high-value-
+        # artefacts ticket). Picks up OneDrive client artefacts
+        # (<UserCid>.dat, SyncEngine SQLite DBs, ODL logs) from the
+        # extracted set and parses them via Beercow OneDriveExplorer
+        # in --LIVE mode. Output is per-tenant report JSON + a
+        # manifest, surfaced as workflow artefacts. No TS upload in
+        # v1 -- OneDriveExplorer emits nested-folder JSON, not an
+        # event stream. A v2 transformer task will fan reports out
+        # into TS-shaped JSONL events for timeline ingestion.
+        #
+        # Worker filters internally on filename pattern + path hint
+        # ("AppData\\Local\\Microsoft\\OneDrive\\..."), so cases
+        # without OneDrive artefacts no-op cleanly and emit a
+        # manifest reporting zero matches -- same fan-out tolerance
+        # as the other analysers.
+        {
+            "task_name": "openrelik-worker-onedrive.tasks.parse_onedrive",
+            "queue_name": "openrelik-worker-onedrive",
+            "display_name": "OneDrive Explorer: parse OneDrive artefacts",
+            "description": "Parse OneDrive client artefacts (<UserCid>.dat, SyncEngine SQLite, ODL logs) via Beercow OneDriveExplorer in --LIVE mode. Output: per-tenant report JSON + manifest. Not TS-bound (v1).",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{onedrive_uuid}",
+            "tasks": [],
+        },
+        # WMI persistence sibling (Phase C #4 of the high-value-
+        # artefacts ticket). Scans OBJECTS.DATA via David Pany's
+        # PyWMIPersistenceFinder, surfaces a text report per input
+        # OBJECTS.DATA file. Not TS-bound -- WMI Filter+Consumer+
+        # Binding records are definitional, not temporal events.
+        #
+        # Worker no-ops cleanly on cases without OBJECTS.DATA in the
+        # extracted set -- same fan-out tolerance as the rest.
+        {
+            "task_name": "openrelik-worker-wmi-persistence.tasks.find_wmi_persistence",
+            "queue_name": "openrelik-worker-wmi-persistence",
+            "display_name": "WMI Persistence: scan OBJECTS.DATA",
+            "description": "Detect Windows WMI Filter+Consumer+Binding persistence by scanning OBJECTS.DATA via David Pany's PyWMIPersistenceFinder. Output: text report per OBJECTS.DATA + manifest. Not TS-bound.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{wmi_uuid}",
+            "tasks": [],
+        },
+        # UAL sibling (kev365's openrelik-worker-kstrike) was wired
+        # into this fan-out previously but removed: the worker raises
+        # RuntimeError on inputs without .mdb files (most cases),
+        # producing a failed task for every case that doesn't ship
+        # UAL artefacts. Upstream issue filed to request fan-out
+        # tolerance (silent no-op like every other triage sibling).
+        # Re-introduce this branch once the upstream patch lands;
+        # until then, kstrike can still be invoked manually per case.
+        # $J reason-flag enrichment sibling (Phase C wire-in --
+        # existing community worker 39dfir-bsg's
+        # openrelik-worker-mftecmd). Runs Eric Zimmerman's MFTECmd
+        # against $MFT + $UsnJrnl:$J + $J + UsnJrnl-J (worker filter
+        # accepts all four shapes). Plaso already produces $J events
+        # in its super-timeline; this worker emits a richer CSV with
+        # the USN reason flags Plaso drops, surfaced as an OR
+        # artefact for analyst download.
+        #
+        # v1 artefact-only -- chaining the CSV through stamp_csv ->
+        # ts.upload would create a second $J timeline parallel to
+        # Plaso's. Better to ship the artefact and decide on the TS
+        # chain after one or two cases inform whether the rich reason
+        # flags pivot is needed.
+        {
+            "task_name": "openrelik-worker-mftecmd.tasks.mftecmd",
+            "queue_name": "openrelik-worker-mftecmd",
+            "display_name": "MFTECmd: parse $MFT / $UsnJrnl:$J",
+            "description": "Run Eric Zimmerman's MFTECmd against $MFT and $UsnJrnl:$J; emit richer-reason-flag CSV than Plaso's usnjrnl parser. v1 artefact-only (no TS chain).",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{mftecmd_uuid}",
+            "tasks": [],
+        },
+        # PCA sibling (Phase C wire-in -- existing community worker
+        # openrelik-contrib's openrelik-worker-eztools, lecmd task).
+        # Win11 introduced the Program Compatibility Assistant (PCA)
+        # which writes execution evidence to text dictionary files
+        # under C:\Windows\appcompat\pca\. LECmd parses those files.
+        # Worker emits CSV per input; v1 artefact-only.
+        #
+        # NOTE: requires Pca collection target in the VR config
+        # (separate openrelik-vr-config PR). Win11-only artefact;
+        # Win10 cases will no-op cleanly.
+        {
+            "task_name": "openrelik-worker-eztools.tasks.lecmd",
+            "queue_name": "openrelik-worker-eztools",
+            "display_name": "PCA: parse via LECmd",
+            "description": "Parse Win11 Program Compatibility Assistant (PCA) text dictionary files in C:\\Windows\\appcompat\\pca\\ via Eric Zimmerman's LECmd. v1 artefact-only.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{pca_uuid}",
             "tasks": [],
         },
     ]

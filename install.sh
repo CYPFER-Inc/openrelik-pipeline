@@ -512,11 +512,15 @@ EOF
     # timesketch-api-client; without this, Timesketch aborts with
     # "Local authentication is disabled for this user. Please use OAuth."
     #
-    # `ai-summary-worker@cypfer.local` is the Phase 3 AI service account
-    # (microcloud:llm/README.md §3). v1 uses local-password auth from the
-    # worker; Phase 7 will migrate to OIDC bearer via GOOGLE_OIDC_API_CLIENT_ID
-    # at which point this entry can be dropped.
-    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin', 'ai-summary-worker@cypfer.local']|" "$TS_CONF"
+    # `ai-summary-worker@cypfer.local` is the v1 AI service account
+    # (microcloud:llm/README.md §3 — read-only).
+    # `ai-tagger@cypfer.local` is the v2 AI service account
+    # (Phase 0 decision #6 — separation of duties: summary stays
+    # read-only, tagger does the TS tag writes).
+    # Both use local-password auth from the worker; Phase 7 will
+    # migrate to OIDC bearer via GOOGLE_OIDC_API_CLIENT_ID at which
+    # point these entries can be dropped.
+    sed -i "s|^LOCAL_AUTH_ALLOWED_USERS = .*|LOCAL_AUTH_ALLOWED_USERS = ['admin', 'ai-summary-worker@cypfer.local', 'ai-tagger@cypfer.local']|" "$TS_CONF"
 
     # Restart Timesketch to pick up OIDC config. Also bounce nginx: it caches
     # the upstream container IP at startup, and when timesketch-web comes back
@@ -556,23 +560,40 @@ EOF
     chmod 600 "${TS_ROSTER_FILE}"
     echo "Seeded TS roster: ${TS_ROSTER_FILE}"
 
-    # ─── Phase 3 (TS, part 1): roster injection — append AI account ──────────
-    # microcloud:llm/README.md §3. The ai-summary-worker user is just another
-    # row in the TS roster from ts-apply.sh's perspective; let the apply
-    # script create it with its random password (which we override below
-    # AFTER apply has run). Decide the password here so it's available for
-    # the env file later in install.sh; preserve from any prior run.
+    # ─── Phase 3 (TS, part 1): roster injection — append AI accounts ─────────
+    # microcloud:llm/README.md §3 + Phase 0 decision #6 (separation of
+    # duties). Two AI accounts:
+    #
+    #   ai-summary-worker@cypfer.local — v1, read-only summary worker.
+    #   ai-tagger@cypfer.local         — v2, writes MITRE/CYPFER tags
+    #                                    back via sketch.tag_events.
+    #
+    # Both are reader role in the roster; sketch ACL grants (step 3b of
+    # ts-apply.sh) give them read+write+delete on every sketch, which
+    # covers tag write. Let ts-apply.sh create both with random
+    # passwords; we override AFTER apply has run via the tsctl shell
+    # block below. Preserve passwords across re-runs from the existing
+    # env file so reinstall doesn't churn creds.
     AI_TS_USER="ai-summary-worker@cypfer.local"
+    AI_TAGGER_TS_USER="ai-tagger@cypfer.local"
     AI_ENV_FILE="/etc/vote-case-ai.env"
     if [ -f "${AI_ENV_FILE}" ] && grep -q '^AI_TS_PASSWORD=' "${AI_ENV_FILE}"; then
       AI_TS_PASSWORD="$(grep '^AI_TS_PASSWORD=' "${AI_ENV_FILE}" | cut -d= -f2- | tr -d '"')"
-      echo "  AI TS password: preserved from ${AI_ENV_FILE}"
+      echo "  AI summary TS password: preserved from ${AI_ENV_FILE}"
     else
       AI_TS_PASSWORD="$(openssl rand -hex 32)"
-      echo "  AI TS password: generated"
+      echo "  AI summary TS password: generated"
+    fi
+    if [ -f "${AI_ENV_FILE}" ] && grep -q '^AI_TAGGER_TS_PASSWORD=' "${AI_ENV_FILE}"; then
+      AI_TAGGER_TS_PASSWORD="$(grep '^AI_TAGGER_TS_PASSWORD=' "${AI_ENV_FILE}" | cut -d= -f2- | tr -d '"')"
+      echo "  AI tagger TS password: preserved from ${AI_ENV_FILE}"
+    else
+      AI_TAGGER_TS_PASSWORD="$(openssl rand -hex 32)"
+      echo "  AI tagger TS password: generated"
     fi
     echo "${AI_TS_USER}=reader" >> "${TS_ROSTER_FILE}"
-    echo "Appended AI service account to TS roster"
+    echo "${AI_TAGGER_TS_USER}=reader" >> "${TS_ROSTER_FILE}"
+    echo "Appended AI service accounts (summary + tagger) to TS roster"
 
     # Apply the roster — TS picks up DB changes live, no restart needed.
     # Roster applier needs the running timesketch-web container (restart above
@@ -621,21 +642,31 @@ EOF
     # didn't persist.
     cd /opt/timesketch
     AI_TS_USER="${AI_TS_USER}" AI_TS_PASSWORD="${AI_TS_PASSWORD}" \
-      docker compose exec -T -e AI_TS_USER -e AI_TS_PASSWORD \
+    AI_TAGGER_TS_USER="${AI_TAGGER_TS_USER}" AI_TAGGER_TS_PASSWORD="${AI_TAGGER_TS_PASSWORD}" \
+      docker compose exec -T \
+        -e AI_TS_USER -e AI_TS_PASSWORD \
+        -e AI_TAGGER_TS_USER -e AI_TAGGER_TS_PASSWORD \
         timesketch-web tsctl shell <<'PYSHELL' 2>&1 | tee /tmp/ai-pwset.out
 import os
 from timesketch.models import db_session
 from timesketch.models.user import User
-u = db_session.query(User).filter_by(username=os.environ["AI_TS_USER"]).first()
-assert u is not None, "AI user not found after ts-apply.sh"
-u.set_password(os.environ["AI_TS_PASSWORD"])
+# Summary worker (v1, read-only).
+u_summary = db_session.query(User).filter_by(username=os.environ["AI_TS_USER"]).first()
+assert u_summary is not None, "AI summary user not found after ts-apply.sh"
+u_summary.set_password(os.environ["AI_TS_PASSWORD"])
+# Tagger worker (v2, writes tags).
+u_tagger = db_session.query(User).filter_by(username=os.environ["AI_TAGGER_TS_USER"]).first()
+assert u_tagger is not None, "AI tagger user not found after ts-apply.sh"
+u_tagger.set_password(os.environ["AI_TAGGER_TS_PASSWORD"])
 db_session.commit()
-print("AI_PWSET_VERIFIED=" + str(u.check_password(os.environ["AI_TS_PASSWORD"])))
+print("AI_SUMMARY_PWSET_VERIFIED=" + str(u_summary.check_password(os.environ["AI_TS_PASSWORD"])))
+print("AI_TAGGER_PWSET_VERIFIED=" + str(u_tagger.check_password(os.environ["AI_TAGGER_TS_PASSWORD"])))
 PYSHELL
-    if grep -q "AI_PWSET_VERIFIED=True" /tmp/ai-pwset.out; then
-      echo "AI user password forcibly set to match /etc/vote-case-ai.env"
+    if grep -q "AI_SUMMARY_PWSET_VERIFIED=True" /tmp/ai-pwset.out \
+       && grep -q "AI_TAGGER_PWSET_VERIFIED=True" /tmp/ai-pwset.out; then
+      echo "AI user passwords (summary + tagger) forcibly set to match /etc/vote-case-ai.env"
     else
-      echo "FATAL: AI user password set_password did not persist — tsctl output above" >&2
+      echo "FATAL: AI user password set_password did not persist for one or both accounts — tsctl output above" >&2
       rm -f /tmp/ai-pwset.out
       exit 1
     fi
@@ -746,6 +777,10 @@ if [ "${INSTALL_OR}" = "true" ]; then
       "ghcr.io/cypfer-inc/openrelik-worker-network-normalizer:${OPENRELIK_WORKER_NETWORK_NORMALIZER_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-chainsaw:${OPENRELIK_WORKER_CHAINSAW_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-host-fingerprint:${OPENRELIK_WORKER_HOST_FINGERPRINT_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-rdp-cache:${OPENRELIK_WORKER_RDP_CACHE_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-onedrive:${OPENRELIK_WORKER_ONEDRIVE_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-bits:${OPENRELIK_WORKER_BITS_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-wmi-persistence:${OPENRELIK_WORKER_WMI_PERSISTENCE_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
       MIRRORED=$(mirror_image "${img}")
       echo "  Pulling ${MIRRORED}..."
@@ -1118,19 +1153,35 @@ psort.py --version || true
   AI_ENV_FILE="/etc/vote-case-ai.env"
   cat > "${AI_ENV_FILE}" <<AIEOF
 # Per-case AI worker credentials — generated by openrelik-pipeline:install.sh
-# on $(date -u +%FT%TZ) for case ${CASE_ID:-unknown}. Phase 3 of the v1 AI
-# integration plan (microcloud:llm/README.md §3).
+# on $(date -u +%FT%TZ) for case ${CASE_ID:-unknown}.
+# v1 (summary) Phase 3 — microcloud:llm/README.md §3.
+# v2 (tagger)  Phase 4 — AI_INTEGRATION_V2_HANDOFF.md.
 #
-# v1 auth model:
+# v1/v2 auth model (both AI workers):
 #   TS: HTTP Basic with AI_TS_USER + AI_TS_PASSWORD against AI_TS_URL
 #   OR: Authorization: Bearer ${AI_OR_API_KEY:0:8}... against AI_OR_URL
+#       (summary worker only; tagger doesn't call the OR API)
 # Phase 7 migrates TS to OIDC bearer; this file's TS_* fields will go away.
+#
+# Worker → env-var mapping (see openrelik-or-config's worker yml files):
+#   openrelik-worker-llm-summary uses AI_TS_USER / AI_TS_PASSWORD.
+#   openrelik-worker-llm-tagger  uses AI_TAGGER_TS_USER / AI_TAGGER_TS_PASSWORD,
+#                                remapped onto its own AI_TS_USER / AI_TS_PASSWORD
+#                                in its compose snippet so the worker code stays
+#                                identical to the summary worker's read-path.
 AI_ACCOUNT="${AI_TS_USER}"
 AI_TS_URL="${TS_URL:-}"
 AI_TS_USER="${AI_TS_USER}"
 AI_TS_PASSWORD="${AI_TS_PASSWORD}"
+AI_TAGGER_TS_USER="${AI_TAGGER_TS_USER}"
+AI_TAGGER_TS_PASSWORD="${AI_TAGGER_TS_PASSWORD}"
 AI_OR_URL="${OR_URL:-}"
 AI_OR_API_KEY="${AI_OR_API_KEY}"
+# v2 tagger feature flag. Default empty = disabled (the worker's
+# _feature_enabled() refuses anything that doesn't parse to true).
+# Phase 6 validation will flip this to "true" per case once a real-case
+# end-to-end run is signed off.
+AI_TAGGER_ENABLED="${AI_TAGGER_ENABLED:-}"
 AIEOF
   chmod 600 "${AI_ENV_FILE}"
   echo "Wrote AI worker credentials: ${AI_ENV_FILE} (chmod 600)"
@@ -1358,6 +1409,67 @@ AIEOF
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-host-fingerprint"
   fi
 
+  # Start the RDP cache worker (Phase C #1 -- bmc-tools wrapper).
+  # Compose block injected by or-config's configure.py from
+  # workers/openrelik-worker-rdp-cache.yml. Worker runs as a sibling
+  # of the other triage analysers; emits per-tile + collage BMP
+  # artefacts to the workflow folder when bcache*.bmc / Cache????.bin
+  # files are present in the extracted input.
+  docker compose up -d openrelik-worker-rdp-cache 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-rdp-cache"; then
+    echo "openrelik-worker-rdp-cache is running"
+  else
+    echo "WARNING: openrelik-worker-rdp-cache failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-rdp-cache"
+  fi
+
+  # Start the OneDrive worker (Phase C #2 -- Beercow OneDriveExplorer
+  # wrapper). Same pattern: compose block injected by or-config's
+  # configure.py from workers/openrelik-worker-onedrive.yml. Worker
+  # runs as a sibling of the other triage analysers; emits per-tenant
+  # report JSON + manifest artefacts when OneDrive client files are
+  # present in the extracted input.
+  docker compose up -d openrelik-worker-onedrive 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-onedrive"; then
+    echo "openrelik-worker-onedrive is running"
+  else
+    echo "WARNING: openrelik-worker-onedrive failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-onedrive"
+  fi
+
+  # Start the BITS worker (Phase C #3 -- ANSSI bits_parser wrapper).
+  # Compose block injected by or-config's configure.py from
+  # workers/openrelik-worker-bits.yml. Worker chains downstream into
+  # stamp_jsonl -> ts.upload (like the chainsaw branches) so BITS
+  # jobs land as their own TS timeline carrying the full ECS host.*
+  # set from the host-fingerprint sidecar.
+  docker compose up -d openrelik-worker-bits 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-bits"; then
+    echo "openrelik-worker-bits is running"
+  else
+    echo "WARNING: openrelik-worker-bits failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-bits"
+  fi
+
+  # Start the WMI persistence worker (Phase C #4 --
+  # PyWMIPersistenceFinder wrapper). Compose block injected by
+  # or-config's configure.py from workers/openrelik-worker-wmi-
+  # persistence.yml. Worker runs as a sibling of the other triage
+  # analysers; emits text reports per OBJECTS.DATA + manifest as
+  # workflow artefacts (not TS-bound; WMI bindings are definitional,
+  # not temporal events).
+  docker compose up -d openrelik-worker-wmi-persistence 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-wmi-persistence"; then
+    echo "openrelik-worker-wmi-persistence is running"
+  else
+    echo "WARNING: openrelik-worker-wmi-persistence failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-wmi-persistence"
+  fi
+
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
   # configure.py adds the worker's compose block to docker-compose.yml from
   # the openrelik-or-config image AND eagerly starts the container with no
@@ -1404,6 +1516,29 @@ AIEOF
     else
       echo "WARNING: openrelik-worker-llm-summary failed to start"
       echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-llm-summary"
+    fi
+  fi
+
+  # ─── Phase 4 (v2): AI worker (openrelik-worker-llm-tagger) ──────────────
+  # Same recreate-with-fresh-env pattern as the summary worker above. The
+  # tagger's compose block is injected by openrelik-or-config's
+  # configure_workers stage (config/workers.yaml entry source=repo). Env
+  # vars were already sourced in the summary worker block above; we
+  # re-use the in-shell exports here.
+  #
+  # The tagger ships gated behind AI_TAGGER_ENABLED=true. Until the case
+  # operator flips that flag in /etc/vote-case-ai.env, the container
+  # comes up but every task raises with a clear "tagger disabled"
+  # message at task entry. This is intentional: Phase 6 validation
+  # gates the flip per case (feedback_ai_feature_flags_default_off).
+  if grep -q "openrelik-worker-llm-tagger" /opt/openrelik/docker-compose.yml 2>/dev/null; then
+    docker compose up -d --force-recreate openrelik-worker-llm-tagger 2>/dev/null
+
+    if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-llm-tagger"; then
+      echo "openrelik-worker-llm-tagger is running (gated by AI_TAGGER_ENABLED in /etc/vote-case-ai.env)"
+    else
+      echo "WARNING: openrelik-worker-llm-tagger failed to start"
+      echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-llm-tagger"
     fi
   fi
 
