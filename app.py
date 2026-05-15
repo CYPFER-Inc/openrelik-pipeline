@@ -1301,7 +1301,6 @@ def add_triage_ts_tasks_to_workflow(
               ├── find_wmi_persistence (wmi)     -> WMI persistence text report
               ├── mftecmd ($MFT/$J)              -> CSV with richer USN reason flags (artefact-only)
               ├── lecmd (PCA / Win11)            -> PCA execution-evidence CSV (artefact-only)
-              ├── ual-timeline (kstrike)         -> stamp_jsonl -> ts (timeline: "<base> - UAL")
               ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
@@ -1366,7 +1365,6 @@ def add_triage_ts_tasks_to_workflow(
     rdp_cache_uuid = str(uuid.uuid4()).replace("-", "")
     onedrive_uuid = str(uuid.uuid4()).replace("-", "")
     wmi_uuid = str(uuid.uuid4()).replace("-", "")
-    kstrike_uuid = str(uuid.uuid4()).replace("-", "")
     mftecmd_uuid = str(uuid.uuid4()).replace("-", "")
     pca_uuid = str(uuid.uuid4()).replace("-", "")
 
@@ -1685,34 +1683,14 @@ def add_triage_ts_tasks_to_workflow(
             "uuid": f"{wmi_uuid}",
             "tasks": [],
         },
-        # UAL sibling (Phase C wire-in -- existing community worker
-        # kev365's openrelik-worker-kstrike). Parses Windows User
-        # Access Logs (.mdb files at %SystemRoot%\System32\LogFiles\
-        # Sum\). Two tasks exposed by the worker: `ual-parse` (raw
-        # CSV) and `ual-timeline` (TS-shaped JSONL). We chain the
-        # latter through stamp_jsonl -> ts.upload so UAL events land
-        # as a named TS timeline carrying the full ECS host.* set.
-        #
-        # NOTE: requires the UAL collection target in the VR config
-        # (separate openrelik-vr-config PR). Without it the worker
-        # no-ops on every case -- the worker filter is correct, the
-        # input set is just empty.
-        {
-            "task_name": "openrelik-worker-kstrike.tasks.ual-timeline",
-            "queue_name": "openrelik-worker-kstrike",
-            "display_name": "UAL: parse + emit TS timeline",
-            "description": "Parse Windows User Access Logging (UAL) .mdb files via Brian Moran's KStrike; emit TS-shaped JSONL. Chained downstream into stamp_jsonl -> ts.upload.",
-            "task_config": [],
-            "type": "task",
-            "uuid": f"{kstrike_uuid}",
-            "tasks": [
-                _stamp_jsonl_then_ts(
-                    sketch_name,
-                    sketch_id,
-                    f"{timeline_name} - UAL",
-                )
-            ],
-        },
+        # UAL sibling (kev365's openrelik-worker-kstrike) was wired
+        # into this fan-out previously but removed: the worker raises
+        # RuntimeError on inputs without .mdb files (most cases),
+        # producing a failed task for every case that doesn't ship
+        # UAL artefacts. Upstream issue filed to request fan-out
+        # tolerance (silent no-op like every other triage sibling).
+        # Re-introduce this branch once the upstream patch lands;
+        # until then, kstrike can still be invoked manually per case.
         # $J reason-flag enrichment sibling (Phase C wire-in --
         # existing community worker 39dfir-bsg's
         # openrelik-worker-mftecmd). Runs Eric Zimmerman's MFTECmd
