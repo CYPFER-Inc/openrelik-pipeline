@@ -1298,6 +1298,10 @@ def add_triage_ts_tasks_to_workflow(
               ├── derive_id (host-fingerprint)   -> sidecar JSON in workflow
               ├── parse_cache (rdp-cache)        -> tile / collage / manifest artefacts
               ├── parse_onedrive (onedrive)      -> per-tenant report JSON + manifest
+              ├── find_wmi_persistence (wmi)     -> WMI persistence text report
+              ├── mftecmd ($MFT/$J)              -> CSV with richer USN reason flags (artefact-only)
+              ├── lecmd (PCA / Win11)            -> PCA execution-evidence CSV (artefact-only)
+              ├── ual-timeline (kstrike)         -> stamp_jsonl -> ts (timeline: "<base> - UAL")
               ├── hayabusa csv_timeline   -> stamp_csv   -> ts (timeline: "<base> - Hayabusa")
               ├── chainsaw hunt_evtx      -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Sigma")
               ├── chainsaw builtin_only   -> stamp_jsonl -> ts (timeline: "<base> - Chainsaw Built-in")
@@ -1361,6 +1365,10 @@ def add_triage_ts_tasks_to_workflow(
     host_fingerprint_uuid = str(uuid.uuid4()).replace("-", "")
     rdp_cache_uuid = str(uuid.uuid4()).replace("-", "")
     onedrive_uuid = str(uuid.uuid4()).replace("-", "")
+    wmi_uuid = str(uuid.uuid4()).replace("-", "")
+    kstrike_uuid = str(uuid.uuid4()).replace("-", "")
+    mftecmd_uuid = str(uuid.uuid4()).replace("-", "")
+    pca_uuid = str(uuid.uuid4()).replace("-", "")
 
     analyser_branches = [
         {
@@ -1657,6 +1665,96 @@ def add_triage_ts_tasks_to_workflow(
             "task_config": [],
             "type": "task",
             "uuid": f"{onedrive_uuid}",
+            "tasks": [],
+        },
+        # WMI persistence sibling (Phase C #4 of the high-value-
+        # artefacts ticket). Scans OBJECTS.DATA via David Pany's
+        # PyWMIPersistenceFinder, surfaces a text report per input
+        # OBJECTS.DATA file. Not TS-bound -- WMI Filter+Consumer+
+        # Binding records are definitional, not temporal events.
+        #
+        # Worker no-ops cleanly on cases without OBJECTS.DATA in the
+        # extracted set -- same fan-out tolerance as the rest.
+        {
+            "task_name": "openrelik-worker-wmi-persistence.tasks.find_wmi_persistence",
+            "queue_name": "openrelik-worker-wmi-persistence",
+            "display_name": "WMI Persistence: scan OBJECTS.DATA",
+            "description": "Detect Windows WMI Filter+Consumer+Binding persistence by scanning OBJECTS.DATA via David Pany's PyWMIPersistenceFinder. Output: text report per OBJECTS.DATA + manifest. Not TS-bound.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{wmi_uuid}",
+            "tasks": [],
+        },
+        # UAL sibling (Phase C wire-in -- existing community worker
+        # kev365's openrelik-worker-kstrike). Parses Windows User
+        # Access Logs (.mdb files at %SystemRoot%\System32\LogFiles\
+        # Sum\). Two tasks exposed by the worker: `ual-parse` (raw
+        # CSV) and `ual-timeline` (TS-shaped JSONL). We chain the
+        # latter through stamp_jsonl -> ts.upload so UAL events land
+        # as a named TS timeline carrying the full ECS host.* set.
+        #
+        # NOTE: requires the UAL collection target in the VR config
+        # (separate openrelik-vr-config PR). Without it the worker
+        # no-ops on every case -- the worker filter is correct, the
+        # input set is just empty.
+        {
+            "task_name": "openrelik-worker-kstrike.tasks.ual-timeline",
+            "queue_name": "openrelik-worker-kstrike",
+            "display_name": "UAL: parse + emit TS timeline",
+            "description": "Parse Windows User Access Logging (UAL) .mdb files via Brian Moran's KStrike; emit TS-shaped JSONL. Chained downstream into stamp_jsonl -> ts.upload.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{kstrike_uuid}",
+            "tasks": [
+                _stamp_jsonl_then_ts(
+                    sketch_name,
+                    sketch_id,
+                    f"{timeline_name} - UAL",
+                )
+            ],
+        },
+        # $J reason-flag enrichment sibling (Phase C wire-in --
+        # existing community worker 39dfir-bsg's
+        # openrelik-worker-mftecmd). Runs Eric Zimmerman's MFTECmd
+        # against $MFT + $UsnJrnl:$J + $J + UsnJrnl-J (worker filter
+        # accepts all four shapes). Plaso already produces $J events
+        # in its super-timeline; this worker emits a richer CSV with
+        # the USN reason flags Plaso drops, surfaced as an OR
+        # artefact for analyst download.
+        #
+        # v1 artefact-only -- chaining the CSV through stamp_csv ->
+        # ts.upload would create a second $J timeline parallel to
+        # Plaso's. Better to ship the artefact and decide on the TS
+        # chain after one or two cases inform whether the rich reason
+        # flags pivot is needed.
+        {
+            "task_name": "openrelik-worker-mftecmd.tasks.mftecmd",
+            "queue_name": "openrelik-worker-mftecmd",
+            "display_name": "MFTECmd: parse $MFT / $UsnJrnl:$J",
+            "description": "Run Eric Zimmerman's MFTECmd against $MFT and $UsnJrnl:$J; emit richer-reason-flag CSV than Plaso's usnjrnl parser. v1 artefact-only (no TS chain).",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{mftecmd_uuid}",
+            "tasks": [],
+        },
+        # PCA sibling (Phase C wire-in -- existing community worker
+        # openrelik-contrib's openrelik-worker-eztools, lecmd task).
+        # Win11 introduced the Program Compatibility Assistant (PCA)
+        # which writes execution evidence to text dictionary files
+        # under C:\Windows\appcompat\pca\. LECmd parses those files.
+        # Worker emits CSV per input; v1 artefact-only.
+        #
+        # NOTE: requires Pca collection target in the VR config
+        # (separate openrelik-vr-config PR). Win11-only artefact;
+        # Win10 cases will no-op cleanly.
+        {
+            "task_name": "openrelik-worker-eztools.tasks.lecmd",
+            "queue_name": "openrelik-worker-eztools",
+            "display_name": "PCA: parse via LECmd",
+            "description": "Parse Win11 Program Compatibility Assistant (PCA) text dictionary files in C:\\Windows\\appcompat\\pca\\ via Eric Zimmerman's LECmd. v1 artefact-only.",
+            "task_config": [],
+            "type": "task",
+            "uuid": f"{pca_uuid}",
             "tasks": [],
         },
     ]

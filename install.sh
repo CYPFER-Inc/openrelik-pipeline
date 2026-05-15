@@ -780,6 +780,7 @@ if [ "${INSTALL_OR}" = "true" ]; then
       "ghcr.io/cypfer-inc/openrelik-worker-rdp-cache:${OPENRELIK_WORKER_RDP_CACHE_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-onedrive:${OPENRELIK_WORKER_ONEDRIVE_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-bits:${OPENRELIK_WORKER_BITS_VERSION:-latest}" \
+      "ghcr.io/cypfer-inc/openrelik-worker-wmi-persistence:${OPENRELIK_WORKER_WMI_PERSISTENCE_VERSION:-latest}" \
       "ghcr.io/cypfer-inc/openrelik-worker-llm-summary:${CYPFER_WORKER_LLM_SUMMARY_DIGEST:-latest}"; do
       MIRRORED=$(mirror_image "${img}")
       echo "  Pulling ${MIRRORED}..."
@@ -1451,6 +1452,22 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-bits failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-bits"
+  fi
+
+  # Start the WMI persistence worker (Phase C #4 --
+  # PyWMIPersistenceFinder wrapper). Compose block injected by
+  # or-config's configure.py from workers/openrelik-worker-wmi-
+  # persistence.yml. Worker runs as a sibling of the other triage
+  # analysers; emits text reports per OBJECTS.DATA + manifest as
+  # workflow artefacts (not TS-bound; WMI bindings are definitional,
+  # not temporal events).
+  docker compose up -d openrelik-worker-wmi-persistence 2>/dev/null
+
+  if docker ps --format "{{.Names}}" | grep -q "openrelik-worker-wmi-persistence"; then
+    echo "openrelik-worker-wmi-persistence is running"
+  else
+    echo "WARNING: openrelik-worker-wmi-persistence failed to start"
+    echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-wmi-persistence"
   fi
 
   # ─── Phase 5: AI worker (openrelik-worker-llm-summary) ──────────────────
