@@ -1436,6 +1436,8 @@ AIEOF
   else
     echo "WARNING: openrelik-worker-onedrive failed to start"
     echo "         Check: docker compose -f /opt/openrelik/docker-compose.yml logs openrelik-worker-onedrive"
+  fi
+
   # Start the BITS worker (Phase C #3 -- ANSSI bits_parser wrapper).
   # Compose block injected by or-config's configure.py from
   # workers/openrelik-worker-bits.yml. Worker chains downstream into
