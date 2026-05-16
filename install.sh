@@ -1972,7 +1972,7 @@ if [ "${INSTALL_TS}" = "true" ]; then
       -e TS_SKETCH_NAME="${TS_SKETCH_NAME}" \
       -e TS_ANALYST_PASSWORD="${TS_ANALYST_PASSWORD:-}" \
       -e TS_LEAD_PASSWORD="${TS_LEAD_PASSWORD:-}" \
-      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-300}" \
+      -e TS_WAIT_TIMEOUT="${TS_WAIT_TIMEOUT:-900}" \
       -e TS_WAIT_INTERVAL="${TS_WAIT_INTERVAL:-5}" \
       -e AUTHENTIK_TS_CLIENT_ID="${AUTHENTIK_TS_CLIENT_ID:-}" \
       -v /var/run/docker.sock:/var/run/docker.sock \
